@@ -202,7 +202,7 @@ def tune(
                          f" compile with message:\n"
                          f" {compile_result.result().error_msg}")
           raise ValueError("No hyperparameters compiled successfully")
-        logger.debug(f"Down to {len(successful_compiles)} hyperparameters")
+        logger.debug("Down to %d hyperparameters", len(successful_compiles))
         # cleanup
         hyperparam_settings = {i: hyperparam_settings[i] 
                                for i in successful_compiles.keys()}

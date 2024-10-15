@@ -8,8 +8,8 @@ readme = "README.md"
 license = { file = "LICENSE" }
 
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [tool.ruff]
 indent-width = 2
