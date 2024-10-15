@@ -1,0 +1,16 @@
+[project]
+name = "tune_jax"
+version = "0.1.0"
+authors = [{ name = "Robert Dyro" }]
+dependencies = ["jax", "numpy", "tqdm"]
+description = "Microbenchmarking hyperparameter tuning for JAX functions."
+readme = "README.md"
+license = { file = "LICENSE" }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+indent-width = 2
+line-length = 80
