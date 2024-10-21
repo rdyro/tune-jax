@@ -58,3 +58,32 @@ v = random.normal(random.key(0), (2 * b, kt, h, d), dtype=jnp.bfloat16)
 tuned_mha_jit(q, k, v, segment_ids=None).block_until_ready()
 tuned_mha_jit(q, k, v, segment_ids=None).block_until_ready()
 ```
+
+## API
+
+```python
+def tune(
+  fn_to_tune: Callable[..., Any],
+  hyperparams: dict[Any, Any],
+  max_workers: int = 32,
+  in_shardings: Any = UNSPECIFIED,
+  out_shardings: Any = UNSPECIFIED,
+  device: jax.Device | _UnspecifiedT = UNSPECIFIED,
+  example_args: tuple[Any] | None = None,
+  example_kws: dict[Any, Any] | None = None,
+):
+  """Tune a function with hyperparameters, even if some fail to compile.
+
+  Args:
+      fn_to_tune (Callable[..., Any]): A jax function to tune.
+      hyperparams (dict[Any, Any]): A flat dictionary of hyperparameter lists.
+      max_workers (int, optional): Max workers for parallel compilation.
+      in_shardings (Any, optional): in_shardings for timing (see jax.jit).
+      out_shardings (Any, optional): out_shardings for timing (see jax.jit).
+      device (jax.Device | _UnspecifiedT, optional): device to tune on if shardings are unspecified.
+      example_args (tuple[Any] | None, optional): Exact example_args to tune with, on correct device.
+      example_kws (dict[Any, Any] | None, optional): Exact example_kws to tune with, on correct device.
+  """
+
+  ...
+```
