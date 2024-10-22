@@ -1,5 +1,7 @@
 # `tune-jax`
 
+Compile-time runtime hyperparameter tuning for JAX functions (e.g., kernels).
+
 This package provides a `tune` decorator for microbenchmarking and tuning JAX functions, particularly Pallas kernels.
 
 ## Installation
