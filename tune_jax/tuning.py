@@ -61,7 +61,6 @@ def _get_default_device():
 def _try_call(fn: Callable[[], None]) -> CompileResult:
   """Attempt to call the function and return whether it compiles and runs."""
   try:
-    _ = fn()
     _ = jax.tree.map(
       lambda x: getattr(x, "block_until_ready", lambda: x)(), fn()
     )
@@ -71,7 +70,7 @@ def _try_call(fn: Callable[[], None]) -> CompileResult:
     return CompileResult(False, msg)
 
 
-def _time_fn(fn: Callable[[], None], repeats: int = 10):
+def _time_fn(fn: Callable[[], None], repeats: int = 5):
   """Time a function in a global single-threaded lock, so system is unloaded."""
   with _global_tuning_lock:
     times = [None for _ in range(repeats)]
@@ -109,14 +108,21 @@ def _make_fn_to_time(fn_to_tune: Callable[..., Any],
 
   return _fn
 
-def _normalize_sharding(sharding_or_spec: PartitionSpec | Sharding | None):
-  if sharding_or_spec is None:
+def _normalize_sharding(arg: jax.Array | np.ndarray | Any, 
+                        sharding_or_spec: PartitionSpec | Sharding | None,
+                        default_device: jax.Device):
+  if not isinstance(arg, (jax.Array, np.ndarray)):
     return None
-  elif (isinstance(sharding_or_spec, PartitionSpec) 
-        and _get_global_mesh() is not None):
-    return NamedSharding(mesh=_get_global_mesh(), spec=sharding_or_spec)
-  else:
+  if isinstance(sharding_or_spec, Sharding):
     return sharding_or_spec
+  global_mesh = _get_global_mesh()
+  if isinstance(sharding_or_spec, PartitionSpec) and global_mesh is not None:
+    return jax.NamedSharding(global_mesh, sharding_or_spec)
+  elif isinstance(sharding_or_spec, PartitionSpec) and global_mesh is None:
+    raise ValueError("If specifying shardings via ParitionSpec, a global mesh"
+                     " must be defined")
+  else:
+    return SingleDeviceSharding(default_device)
 
 def tune(
   fn_to_tune: Callable[..., Any],
@@ -142,6 +148,10 @@ def tune(
   """
 
   def _get_random_value(arr, sharding):
+    """Random values based on the tracer shape and dtype, and the sharding."""
+    
+    # TODO(rdyro): these values get initialized on the default device before
+    # being moved to the correct sharding, maybe use direct on-device generation
     if isinstance(arr, jax.Array):
       if jnp.issubdtype(arr.dtype, jnp.floating):
         return jax.device_put(random.normal(random.key(0), arr.shape, 
@@ -154,16 +164,24 @@ def tune(
       return arr
 
   def _get_best_hyperparams(args, kws):
+    """Main tuning method."""
+
+    # resolve sharding and/or device placement #################################
     if example_args is not None:
       args_val = example_args 
+      if in_shardings is not UNSPECIFIED or device is not UNSPECIFIED:
+        raise ValueError("`example_args` cannot be used with in_shardings or"
+                         " device. `example_args` should already be correctly"
+                         " sharded.")
     else:
-      if _get_global_mesh() is not None and in_shardings is not UNSPECIFIED:
-        shardings = jax.tree.map(_normalize_sharding, in_shardings)
-      elif device is not UNSPECIFIED:
-        shardings = jax.tree.map(lambda _: SingleDeviceSharding(device), args)
-      else:
-        shardings = jax.tree.map(lambda _: SingleDeviceSharding(
-          _get_default_device()), args)
+      default_device = (device if device is not UNSPECIFIED 
+                        else _get_default_device())
+      shardings = (in_shardings if in_shardings is not UNSPECIFIED
+                   else jax.tree.map(lambda _: None, args))
+      shardings = (shardings,) if len(args) == 1 else shardings
+      shardings = jax.tree.map(functools.partial(
+        _normalize_sharding, default_device=default_device), 
+        tuple(args), tuple(shardings))
       args_val = jax.tree.map(_get_random_value, args, shardings)
 
     if example_kws is not None:
@@ -182,7 +200,10 @@ def tune(
       itertools.product(*hyperparams_norm.values()))}
 
     with _global_tuning_lock:
-      while True:
+      # filter hyperparameters for those that compile ##########################
+      # repeat until the number stabilizes
+      # sometimes a kernel compiles once, but not twice
+      while True:  
         compiles: dict[str, Future[CompileResult]] = dict()
         for i, kws in hyperparam_settings.items():
           hs = {k: v for k, v in zip(hyperparams_norm.keys(), kws)}
@@ -208,10 +229,11 @@ def tune(
                                for i in successful_compiles.keys()}
         fns = {i: fns[i] for i in successful_compiles.keys()}
 
-    # sequentially time the remaining hyperparameters
+    # sequentially time the remaining hyperparameters ##########################
+    # the _time_fn will acquire the lock on its own
     results = dict()
     hs_pbar = tqdm(hyperparam_settings.items(), total=len(hyperparam_settings), 
-                   disable=logger.level > logging.DEBUG, desc="Timing...")
+                  disable=logger.level > logging.DEBUG, desc="Timing...")
     for i, hs in hs_pbar:
       hs = {k: v for k, v in zip(hyperparams_norm.keys(), hs)}
       results[i] = TimingResult(
@@ -235,6 +257,7 @@ def tune(
 
 def test_main():
   hyperparams = {
+    # anything below 16 will fail since the smallest matmul block is 16x16
     "block_q": [4, 8, 16, 32, 64, 128],
     "block_k": [4, 8, 16, 32, 64, 128],
   }
