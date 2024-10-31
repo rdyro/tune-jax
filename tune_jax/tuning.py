@@ -242,7 +242,7 @@ def tune(
     for i, hs in hs_pbar:
       hs = {k: v for k, v in zip(hyperparams_norm.keys(), hs)}
       results[i] = TimingResult(
-        hs, *_time_fn(lambda: fns[i](*args_val, **kws_val), repeats=10))
+        hs, *_time_fn(lambda: fns[i](*args_val, **kws_val), repeat=10))
 
     results = sorted(results.items(), key=lambda x: _timing_loss(x[1]))
     idx, optimal_hyperparams = results[0][0], results[0][1].hyperparams
