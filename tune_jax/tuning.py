@@ -10,6 +10,7 @@ from typing import Callable, Any
 from concurrent.futures import ThreadPoolExecutor, Future
 import logging
 from pprint import pformat
+from timeit import Timer
 
 import jax
 from jax import numpy as jnp
@@ -70,21 +71,25 @@ def _try_call(fn: Callable[[], None]) -> CompileResult:
     return CompileResult(False, msg)
 
 
-def _time_fn(fn: Callable[[], None], repeats: int = 5):
+def _time_fn(fn: Callable[[], None], repeat: int = 5, number: int = 3):
   """Time a function in a global single-threaded lock, so system is unloaded."""
   with _global_tuning_lock:
-    times = [None for _ in range(repeats)]
+    times = [None for _ in range(repeat)]
 
     def _blocked_call():
       return jax.tree.map(
         lambda x: getattr(x, "block_until_ready", lambda: x)(), fn())
 
-    start = time.time_ns()
-    for i in range(repeats):
-      _blocked_call()
-      times[i] = time.time_ns()
+    t = Timer("_blocked_call()", globals={"_blocked_call": _blocked_call})
+    #timings = 
+    #start = time.time_ns()
+    #for i in range(repeats):
+    #  _blocked_call()
+    #  times[i] = time.time_ns()
+    #times = np.diff(np.array([start] + times) - start) / 1e9  # in seconds
 
-    times = np.diff(np.array([start] + times) - start) / 1e9  # in seconds
+    times = [x / number for x in t.repeat(repeat=repeat, number=number)]
+
     times = np.sort(times)[:-1]  # drop the slowest time
     t_mean, t_std = np.mean(times), np.std(times)
     return t_mean, t_std
@@ -243,12 +248,14 @@ def tune(
     idx, optimal_hyperparams = results[0][0], results[0][1].hyperparams
     logger.debug(pformat(results))
     logger.debug(f"optimal hyperparams: {optimal_hyperparams}")
-    return fns[idx], optimal_hyperparams
+    return fns[idx], optimal_hyperparams, results
 
   @functools.wraps(fn_to_tune)
   def wrapped_fn(*args, **kws):
     with jax.ensure_compile_time_eval():
-      _, optimal_hyperparameters = _get_best_hyperparams(args=args, kws=kws)
+      _, optimal_hyperparameters, results = _get_best_hyperparams(args=args, 
+                                                                  kws=kws)
+    wrapped_fn.timing_results = results
     return fn_to_tune(*args, **dict(kws, **optimal_hyperparameters))
 
   return wrapped_fn
