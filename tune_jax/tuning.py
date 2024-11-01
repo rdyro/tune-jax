@@ -30,6 +30,7 @@ if not logger.handlers:
   handler.setFormatter(logging.Formatter(logging.BASIC_FORMAT))
   logger.addHandler(handler)
 logger.setLevel(logging.DEBUG)
+context_escape_pool_executor = ThreadPoolExecutor(max_workers=8)
 
 _global_tuning_lock = threading.Lock()
 
@@ -73,6 +74,7 @@ def _try_call(fn: Callable[[], None]) -> CompileResult:
 
 def _time_fn(fn: Callable[[], None], repeat: int = 5, number: int = 3):
   """Time a function in a global single-threaded lock, so system is unloaded."""
+  assert repeat >= 2, f"{repeat = } must be >= 2, we discard slowest result."
   with _global_tuning_lock:
     times = [None for _ in range(repeat)]
 
@@ -80,15 +82,16 @@ def _time_fn(fn: Callable[[], None], repeat: int = 5, number: int = 3):
       return jax.tree.map(
         lambda x: getattr(x, "block_until_ready", lambda: x)(), fn())
 
-    t = Timer("_blocked_call()", globals={"_blocked_call": _blocked_call})
-    #timings = 
-    #start = time.time_ns()
-    #for i in range(repeats):
-    #  _blocked_call()
-    #  times[i] = time.time_ns()
-    #times = np.diff(np.array([start] + times) - start) / 1e9  # in seconds
+    times = [None for _ in range(repeat)]
+    start = time.perf_counter()
+    for r in range(repeat):
+      for i in range(number):
+        _blocked_call()
+      times[r] = time.perf_counter()
+    times = np.diff(np.array([start] + times) - start) / number # in seconds
 
-    times = [x / number for x in t.repeat(repeat=repeat, number=number)]
+    #t = Timer("_blocked_call()", globals={"_blocked_call": _blocked_call})
+    #times = [x / number for x in t.repeat(repeat=repeat, number=number)]
 
     times = np.sort(times)[:-1]  # drop the slowest time
     t_mean, t_std = np.mean(times), np.std(times)
@@ -252,9 +255,11 @@ def tune(
 
   @functools.wraps(fn_to_tune)
   def wrapped_fn(*args, **kws):
-    with jax.ensure_compile_time_eval():
-      _, optimal_hyperparameters, results = _get_best_hyperparams(args=args, 
-                                                                  kws=kws)
+    #with jax.ensure_compile_time_eval():
+    #  _, optimal_hyperparameters, results = _get_best_hyperparams(args=args, 
+    #                                                              kws=kws)
+    _, optimal_hyperparameters, results = context_escape_pool_executor.submit(
+      _get_best_hyperparams, args, kws).result()
     wrapped_fn.timing_results = results
     return fn_to_tune(*args, **dict(kws, **optimal_hyperparameters))
 
