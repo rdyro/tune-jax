@@ -10,14 +10,13 @@ from typing import Callable, Any
 from concurrent.futures import ThreadPoolExecutor, Future
 import logging
 from pprint import pformat
-from timeit import Timer
 
 import jax
+import jax.core
 from jax import numpy as jnp
 from jax import random
 from jax.interpreters import pxla
-from jax.sharding import (PartitionSpec, NamedSharding, Sharding, 
-                          SingleDeviceSharding)
+from jax.sharding import PartitionSpec, Sharding, SingleDeviceSharding
 from jax.experimental.pallas.ops.gpu import attention
 import numpy as np
 from tqdm import tqdm
@@ -64,7 +63,7 @@ def _try_call(fn: Callable[[], None]) -> CompileResult:
   """Attempt to call the function and return whether it compiles and runs."""
   try:
     _ = jax.tree.map(
-      lambda x: getattr(x, "block_until_ready", lambda: x)(), fn()
+      lambda x: getattr(x, "block_until_ready", lambda: x)(), fn() # type: ignore
     )
     return CompileResult(True, None)
   except Exception as _:
@@ -72,51 +71,49 @@ def _try_call(fn: Callable[[], None]) -> CompileResult:
     return CompileResult(False, msg)
 
 
-def _time_fn(fn: Callable[[], None], repeat: int = 5, number: int = 3):
+def _time_fn(fn: Callable[[], None], repeat: int = 5, number: int = 3
+             ) -> tuple[float, float]:
   """Time a function in a global single-threaded lock, so system is unloaded."""
   assert repeat >= 2, f"{repeat = } must be >= 2, we discard slowest result."
   with _global_tuning_lock:
-    times = [None for _ in range(repeat)]
-
     def _blocked_call():
       return jax.tree.map(
         lambda x: getattr(x, "block_until_ready", lambda: x)(), fn())
 
-    times = [None for _ in range(repeat)]
+    times_raw = []
     start = time.perf_counter()
     for r in range(repeat):
       for i in range(number):
         _blocked_call()
-      times[r] = time.perf_counter()
-    times = np.diff(np.array([start] + times) - start) / number # in seconds
+      times_raw.append(time.perf_counter())
+    # in seconds
+    times = np.diff(np.array([start] + times_raw) - start) / number
 
-    #t = Timer("_blocked_call()", globals={"_blocked_call": _blocked_call})
-    #times = [x / number for x in t.repeat(repeat=repeat, number=number)]
-
-    times = np.sort(times)[:-1]  # drop the slowest time
-    t_mean, t_std = np.mean(times), np.std(times)
-    return t_mean, t_std
+    sorted_times = np.sort(times)[:-1]  # drop the slowest time
+    t_mean, t_std = np.mean(sorted_times), np.std(sorted_times)
+    return float(t_mean), float(t_std)
 
 def _timing_loss(result: TimingResult):
   """Compute a loss function for the timing result."""
   return result.t_mean + 0.1 * result.t_std
 
-def _make_fn_to_time(fn_to_tune: Callable[..., Any], 
-                     hyperparams: dict[str, Any], 
-                     out_shardings: Sharding | _UnspecifiedT = UNSPECIFIED):
+def _make_fn_to_time(fn_to_tune: Callable[..., Any],
+                     hyperparams: dict[str, Any],
+                     out_shardings: Sharding | _UnspecifiedT = UNSPECIFIED
+                     ) -> Callable[..., Any]:
   """Embed hyperparameters into a function to time."""
 
   jit_opts = dict()
   if out_shardings is not UNSPECIFIED:
     jit_opts = dict(out_shardings=out_shardings)
 
-  @functools.partial(jax.jit, **jit_opts)
+  @functools.partial(jax.jit, **jit_opts)  # type: ignore[misc, arg-type]
   def _fn(*args, **kws):
     return fn_to_tune(*args, **dict(kws, **hyperparams))
 
   return _fn
 
-def _normalize_sharding(arg: jax.Array | np.ndarray | Any, 
+def _normalize_sharding(arg: jax.Array | np.ndarray | Any,
                         sharding_or_spec: PartitionSpec | Sharding | None,
                         default_device: jax.Device):
   if not isinstance(arg, (jax.Array, np.ndarray)):
@@ -157,12 +154,12 @@ def tune(
 
   def _get_random_value(arr, sharding):
     """Random values based on the tracer shape and dtype, and the sharding."""
-    
+
     # TODO(rdyro): these values get initialized on the default device before
     # being moved to the correct sharding, maybe use direct on-device generation
     if isinstance(arr, jax.Array):
       if jnp.issubdtype(arr.dtype, jnp.floating):
-        return jax.device_put(random.normal(random.key(0), arr.shape, 
+        return jax.device_put(random.normal(random.key(0), arr.shape,
                                             dtype=arr.dtype), sharding)
       elif jnp.issubdtype(arr.dtype, jnp.integer):
         return jax.device_put(np.zeros(arr.shape, dtype=arr.dtype), sharding)
@@ -176,25 +173,27 @@ def tune(
 
     # resolve sharding and/or device placement #################################
     if example_args is not None:
-      args_val = example_args 
+      args_val = example_args
       if in_shardings is not UNSPECIFIED or device is not UNSPECIFIED:
         raise ValueError("`example_args` cannot be used with in_shardings or"
                          " device. `example_args` should already be correctly"
                          " sharded.")
     else:
-      default_device = (device if device is not UNSPECIFIED 
-                        else _get_default_device())
+      if isinstance(device, jax.Device):
+        resolved_device = device
+      else:
+        resolved_device = _get_default_device()
       shardings = (in_shardings if in_shardings is not UNSPECIFIED
                    else jax.tree.map(lambda _: None, args))
       shardings = (shardings,) if len(args) == 1 else shardings
       shardings = jax.tree.map(functools.partial(
-        _normalize_sharding, default_device=default_device), 
+        _normalize_sharding, default_device=resolved_device),
         tuple(args), tuple(shardings))
       args_val = jax.tree.map(_get_random_value, args, shardings)
 
     if example_kws is not None:
-      kws_val = example_kws 
-    else: 
+      kws_val = example_kws
+    else:
       kws_val = jax.tree.map(_get_random_value, kws)
 
     hyperparams_norm = {
@@ -204,21 +203,21 @@ def tune(
     executor = ThreadPoolExecutor(max_workers=max_workers)
 
     fns = dict()
-    hyperparam_settings = {i: hs for i, hs in enumerate(
-      itertools.product(*hyperparams_norm.values()))}
+    hyperparam_settings = dict(enumerate(
+        itertools.product(*hyperparams_norm.values())))
 
     with _global_tuning_lock:
       # filter hyperparameters for those that compile ##########################
       # repeat until the number stabilizes
       # sometimes a kernel compiles once, but not twice
-      while True:  
-        compiles: dict[str, Future[CompileResult]] = dict()
+      while True:
+        compiles: dict[int, Future[CompileResult]] = dict()
         for i, kws in hyperparam_settings.items():
-          hs = {k: v for k, v in zip(hyperparams_norm.keys(), kws)}
+          hs = dict(zip(hyperparams_norm.keys(), kws))
           fns[i] = _make_fn_to_time(fn_to_tune, hs, out_shardings=out_shardings)
           compiles[i] = executor.submit(
             lambda fn: _try_call(lambda: fn(*args_val, **kws_val)), fns[i])
-        future_pbar = tqdm(compiles.items(), total=len(compiles), 
+        future_pbar = tqdm(compiles.items(), total=len(compiles),
                            disable=logger.level > logging.DEBUG,
                            desc="Compiling...")
         successful_compiles = {k: x.result() for (k, x) in future_pbar
@@ -227,23 +226,23 @@ def tune(
           break
         if len(successful_compiles) == 0:
           for i, compile_result in compiles.items():
-            logger.error(f"Hyperparameters {hyperparam_settings[i]} failed to" 
+            logger.error(f"Hyperparameters {hyperparam_settings[i]} failed to"
                          f" compile with message:\n"
                          f" {compile_result.result().error_msg}")
           raise ValueError("No hyperparameters compiled successfully")
         logger.debug("Down to %d hyperparameters", len(successful_compiles))
         # cleanup
-        hyperparam_settings = {i: hyperparam_settings[i] 
+        hyperparam_settings = {i: hyperparam_settings[i]
                                for i in successful_compiles.keys()}
         fns = {i: fns[i] for i in successful_compiles.keys()}
 
     # sequentially time the remaining hyperparameters ##########################
     # the _time_fn will acquire the lock on its own
     results = dict()
-    hs_pbar = tqdm(hyperparam_settings.items(), total=len(hyperparam_settings), 
+    hs_pbar = tqdm(hyperparam_settings.items(), total=len(hyperparam_settings),
                   disable=logger.level > logging.DEBUG, desc="Timing...")
     for i, hs in hs_pbar:
-      hs = {k: v for k, v in zip(hyperparams_norm.keys(), hs)}
+      hs = dict(zip(hyperparams_norm.keys(), hs))
       results[i] = TimingResult(
         hs, *_time_fn(lambda: fns[i](*args_val, **kws_val), repeat=10))
 
@@ -255,12 +254,9 @@ def tune(
 
   @functools.wraps(fn_to_tune)
   def wrapped_fn(*args, **kws):
-    #with jax.ensure_compile_time_eval():
-    #  _, optimal_hyperparameters, results = _get_best_hyperparams(args=args, 
-    #                                                              kws=kws)
-    _, optimal_hyperparameters, results = context_escape_pool_executor.submit(
-      _get_best_hyperparams, args, kws).result()
-    wrapped_fn.timing_results = results
+    with jax.core.eval_context():
+      _, optimal_hyperparameters, results = _get_best_hyperparams(args, kws)
+    # wrapped_fn.timing_results = results
     return fn_to_tune(*args, **dict(kws, **optimal_hyperparameters))
 
   return wrapped_fn
@@ -296,7 +292,7 @@ def test_main():
       forward_twice(q, k, v).block_until_ready()
       forward_twice(q, k, v).block_until_ready()
 
-    return 
+    return
 
   tuned_mha_jit(q, k, v, segment_ids=None).block_until_ready()
   tuned_mha_jit(q, k, v, segment_ids=None).block_until_ready()
