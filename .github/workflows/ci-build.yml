@@ -34,3 +34,33 @@ jobs:
           path: ~/.cache/pre-commit
           key: pre-commit-${{ env.pythonLocation }}-${{ hashFiles('.pre-commit-config.yaml', 'setup.py') }}
       - run: pre-commit run --show-diff-on-failure --color=always --all-files
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.11
+      - name: Get uv cache dir
+        id: uv-cache
+        run: |
+          python3 -m pip install -U uv pip
+          echo "dir=$(uv cache dir)" >> $GITHUB_OUTPUT
+          echo "pyver=$(python3 -V)" >> $GITHUB_OUTPUT
+      - uses: actions/cache@v4
+        name: uv cache
+        with:
+          path: ${{ steps.uv-cache.outputs.dir }}
+          key: ${{ runner.os }}-uv-py${{ steps.uv-cache.outputs.pyver }}
+      - name: Install uv and pytest
+        run: |
+          uv venv --seed ~/.venv
+          source ~/.venv/bin/activate
+          uv pip install pytest && pip install pytest
+          uv pip install .
+      - name: Run tests
+        run: |
+          source ~/.venv/bin/activate
+          pytest tests/*

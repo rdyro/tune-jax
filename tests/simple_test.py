@@ -5,12 +5,41 @@ from jax import numpy as jnp
 from jax import random
 from jax.experimental.pallas.ops.gpu import attention
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
+import pytest
 
 from tune_jax import tune, tune_logger
 
 tune_logger.setLevel("DEBUG")
 
-def test_simple():
+def gpu_available():
+  try:
+    jax.devices("cuda")
+    return True
+  except:
+    return False
+
+def test_matmul_size():
+  hyperparams = {
+    "n": [128, 1024],
+    "m": [128, 2056],
+  }
+
+  def fn(n, m):
+    keys = random.split(random.key(0), 2)
+    A = random.normal(keys[0], (n, m), dtype=jnp.float32)
+    B = random.normal(keys[1], (m, n), dtype=jnp.float32)
+    C = A @ B
+    return C / jnp.linalg.norm(C, axis=-1)[..., None]
+
+  tuned_mha = tune(fn, hyperparams=hyperparams)
+  tuned_mha_jit = jax.jit(tuned_mha)
+
+  _ = tuned_mha_jit().block_until_ready()
+  C = tuned_mha_jit().block_until_ready()
+  assert C.shape[-1] == 128
+
+@pytest.mark.skipif(not gpu_available(), reason="No GPU available")
+def test_simple_mha():
   hyperparams = {
     "block_q": [4, 8, 16, 32, 64, 128],
     "block_k": [4, 8, 16, 32, 64, 128],
@@ -34,6 +63,7 @@ def test_simple():
   tuned_mha_jit(q, k, v, segment_ids=None).block_until_ready()
   tuned_mha_jit(q, k, v, segment_ids=None).block_until_ready()
 
+@pytest.mark.skipif(not gpu_available(), reason="No GPU available")
 def test_multidevice():
   hyperparams = {
     "block_q": [4, 8, 16, 32, 64, 128],
@@ -70,5 +100,6 @@ def test_multidevice():
   tuned_mha_jit(q, k, v).block_until_ready()
 
 if __name__ == "__main__":
-  test_simple()
+  test_matmul_size()
+  test_simple_mha()
   test_multidevice()
