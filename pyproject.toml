@@ -1,6 +1,6 @@
 [project]
 name = "tune_jax"
-version = "0.2.1"
+version = "0.3.0"
 authors = [{ name = "Robert Dyro" }]
 dependencies = ["jax", "numpy", "tqdm", "protobuf"]
 description = "Microbenchmarking hyperparameter tuning for JAX functions."
@@ -17,6 +17,7 @@ exclude = [
     ".git",
     "build",
     "__pycache__",
+    "tune_jax/profile_reader/xplane_pb2.py",
 ]
 line-length = 120
 indent-width = 2

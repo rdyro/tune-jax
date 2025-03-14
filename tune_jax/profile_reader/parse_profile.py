@@ -130,10 +130,7 @@ def get_scopes_trie(events: dict[Event, list[float]]) -> dict[str, TrieNode]:
 
 
 if __name__ == "__main__":
-  all_profiles = sum(
-    [[r / f for f in fs if f.endswith(".xplane.pb")] for (r, _, fs) in Path("~/profiles").expanduser().walk()],
-    [],
-  )
+  all_profiles = list(Path("~/profiles").expanduser().glob("**/*.xplane.pb"))
   latest_profile = sorted(all_profiles, key=lambda x: x.stat().st_mtime)[-1]
   print(f"latest profile = {latest_profile}")
   p = parse_profile_from_bytes(latest_profile.read_bytes())

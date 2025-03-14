@@ -11,6 +11,7 @@ from tune_jax import tune, tune_logger
 
 tune_logger.setLevel("DEBUG")
 
+
 def gpu_available():
   try:
     jax.devices("cuda")
@@ -18,10 +19,11 @@ def gpu_available():
   except:
     return False
 
+
 def test_matmul_size():
   hyperparams = {
-    "n": [128, 1024],
-    "m": [128, 2056],
+    "n": [64, 4096],
+    "m": [64, 4096],
   }
 
   def fn(n, m):
@@ -36,7 +38,8 @@ def test_matmul_size():
 
   _ = tuned_mha_jit().block_until_ready()
   C = tuned_mha_jit().block_until_ready()
-  assert C.shape[-1] == 128
+  assert C.shape[-1] == min(hyperparams["n"])
+
 
 @pytest.mark.skipif(not gpu_available(), reason="No GPU available")
 def test_simple_mha():
@@ -52,7 +55,14 @@ def test_simple_mha():
   k = random.normal(random.key(0), (b, kt, h, d), dtype=jnp.bfloat16)
   v = random.normal(random.key(0), (b, kt, h, d), dtype=jnp.bfloat16)
 
-  tuned_mha = tune(attention.mha, hyperparams=hyperparams)
+  if hasattr(attention, "BlockSizes"):
+    attention_wrapper = lambda *args, block_q=None, block_k=None, **kw: attention.mha(
+      *args,
+      **dict(kw, block_sizes=attention.BlockSizes(block_q=block_q, block_k=block_k)),
+    )
+    tuned_mha = tune(attention_wrapper, hyperparams=hyperparams)
+  else:  # jax < 0.5.2
+    tuned_mha = tune(attention.mha, hyperparams=hyperparams)
   tuned_mha_jit = jax.jit(tuned_mha)
 
   tuned_mha_jit(q, k, v, segment_ids=None).block_until_ready()
@@ -62,6 +72,7 @@ def test_simple_mha():
   v = random.normal(random.key(0), (2 * b, kt, h, d), dtype=jnp.bfloat16)
   tuned_mha_jit(q, k, v, segment_ids=None).block_until_ready()
   tuned_mha_jit(q, k, v, segment_ids=None).block_until_ready()
+
 
 @pytest.mark.skipif(not gpu_available(), reason="No GPU available")
 def test_multidevice():
@@ -82,14 +93,22 @@ def test_multidevice():
   k = random.normal(random.key(0), (b, kt, h, d), dtype=jnp.bfloat16)
   v = random.normal(random.key(0), (b, kt, h, d), dtype=jnp.bfloat16)
 
-  in_shardings = tuple(NamedSharding(mesh, P(*(["x"] + [None] * (z.ndim - 1))))
-                       for z in [q, k, v])
-  q, k, v = jax.tree.map(lambda x, y: jax.device_put(x, y),
-                         [q, k, v], in_shardings)
+  in_shardings = tuple(NamedSharding(mesh, P(*(["x"] + [None] * (z.ndim - 1)))) for z in [q, k, v])
+  q, k, v = jax.tree.map(lambda x, y: jax.device_put(x, y), [q, k, v], in_shardings)
 
-  tuned_mha = tune(functools.partial(attention.mha, segment_ids=None),
-                   hyperparams=hyperparams, in_shardings=in_shardings)
-  tuned_mha_jit = jax.jit(tuned_mha, in_shardings=in_shardings) # type: ignore
+  if hasattr(attention, "BlockSizes"):
+    attention_wrapper = lambda *args, block_q=None, block_k=None, **kw: attention.mha(
+      *args,
+      **dict(kw, block_sizes=attention.BlockSizes(block_q=block_q, block_k=block_k)),
+    )
+    tuned_mha = tune(
+      functools.partial(attention_wrapper, segment_ids=None), hyperparams=hyperparams, in_shardings=in_shardings
+    )
+  else:  # jax < 0.5.2
+    tuned_mha = tune(
+      functools.partial(attention.mha, segment_ids=None), hyperparams=hyperparams, in_shardings=in_shardings
+    )
+  tuned_mha_jit = jax.jit(tuned_mha, in_shardings=in_shardings)  # type: ignore
 
   tuned_mha_jit(q, k, v).block_until_ready()
   tuned_mha_jit(q, k, v).block_until_ready()
@@ -98,6 +117,7 @@ def test_multidevice():
   v = random.normal(random.key(0), (2 * b, kt, h, d), dtype=jnp.bfloat16)
   tuned_mha_jit(q, k, v).block_until_ready()
   tuned_mha_jit(q, k, v).block_until_ready()
+
 
 if __name__ == "__main__":
   test_matmul_size()

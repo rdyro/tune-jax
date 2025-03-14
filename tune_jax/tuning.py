@@ -169,6 +169,7 @@ def _experimental_time_with_profiler(
 ) -> dict[int, tuple[float, float]]:
   with tempfile.TemporaryDirectory(delete=False) as tempdir:
     profile_path = Path(tempdir).absolute()
+    logger.debug("Saving optimization profile to `%s`", profile_path)
     profile_path.mkdir(exist_ok=True)
 
     with jax.profiler.trace(str(profile_path)):
@@ -320,13 +321,17 @@ def tune(
           hs = dict(zip(hyperparams_norm.keys(), hs))
           _time_fn(lambda: fns[i](*args_val, **kws_val), repeat=10)
 
-      platform = list(jax.tree.leaves(args_val)[0].devices())[0].platform
+      if len(jax.tree.leaves(args_val)) > 0:
+        platform = list(jax.tree.leaves(args_val)[0].devices())[0].platform
+      else:
+        platform = _get_default_device().platform
       profiler_timings = _experimental_time_with_profiler(_timing_closure, platform)
       for i, hs in hs_pbar:
         hs = dict(zip(hyperparams_norm.keys(), hs))
         results[i] = TimingResult(hs, *profiler_timings[i])
     except Exception as _:
       # old timing fallback
+      logger.debug(traceback.format_exc())
       warn("Could not time with the profiler, falling back to Python-level timing")
       for i, hs in hs_pbar:
         hs = dict(zip(hyperparams_norm.keys(), hs))
