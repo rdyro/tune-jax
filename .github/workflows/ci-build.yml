@@ -28,7 +28,7 @@ jobs:
         uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
         with:
           python-version: 3.11
-      - run: python -m pip install pre-commit
+      - run: python -m pip install pre-commit types-protobuf
       - uses: actions/cache@6849a6489940f00c2f30c0fb92c6274307ccb58a # v4.1.2
         with:
           path: ~/.cache/pre-commit

@@ -18,7 +18,7 @@ exclude = [
     "build",
     "__pycache__",
 ]
-line-length = 88
+line-length = 120
 indent-width = 2
 target-version = "py310"
 

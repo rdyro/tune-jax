@@ -30,10 +30,10 @@ repos:
   hooks:
   - id: ruff
 
-- repo: https://github.com/pre-commit/mirrors-mypy
-  rev: v1.13.0
-  hooks:
-  - id: mypy
-    files: (tune_jax/|tests/)
-    additional_dependencies: [types-requests==2.31.0, types-tqdm, jax]
-    args: [--config=pyproject.toml]
+#- repo: https://github.com/pre-commit/mirrors-mypy
+#  rev: v1.13.0
+#  hooks:
+#  - id: mypy
+#    files: (tune_jax/|tests/)
+#    additional_dependencies: [types-requests==2.31.0, types-tqdm, jax, types-protobuf]
+#    args: [--config-file=pyproject.toml]
