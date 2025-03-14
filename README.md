@@ -49,7 +49,12 @@ q = random.normal(random.key(0), (b, qt, h, d), dtype=jnp.bfloat16)
 k = random.normal(random.key(0), (b, kt, h, d), dtype=jnp.bfloat16)
 v = random.normal(random.key(0), (b, kt, h, d), dtype=jnp.bfloat16)
 
-tuned_mha = tune(attention.mha, hyperparams=hyperparams)
+attention_wrapper = lambda *args, block_q=None, block_k=None, **kw: attention.mha(
+*args,
+**dict(kw, block_sizes=attention.BlockSizes(block_q=block_q, block_k=block_k)),
+)
+
+tuned_mha = tune(attention_wrapper, hyperparams=hyperparams)
 tuned_mha_jit = jax.jit(tuned_mha)
 
 tuned_mha_jit(q, k, v, segment_ids=None).block_until_ready()
