@@ -49,6 +49,7 @@ logger.setLevel(logging.WARNING)
 
 _timer_indent = 0
 
+
 @contextlib.contextmanager
 def Timer(task_name: str):
   global _timer_indent
@@ -59,6 +60,7 @@ def Timer(task_name: str):
   finally:
     _timer_indent -= 2
     logger.debug(("  " * _timer_indent) + f"{task_name} took {time.time() - __t:.4e} s")
+
 
 context_escape_pool_executor = ThreadPoolExecutor(max_workers=8)
 _global_tuning_lock = threading.Lock()
@@ -144,19 +146,13 @@ def _make_fn_to_time(
 ) -> Callable[..., Any]:
   """Embed hyperparameters into a function to time."""
 
-  # jit_opts = dict()
-  # if out_shardings is not UNSPECIFIED:
-  #  jit_opts = dict(out_shardings=out_shardings)
-
   jit_wrapper = functools.partial(jax.jit, out_shardings=out_shardings if out_shardings is not UNSPECIFIED else None)
 
-  # @functools.partial(jax.jit, **jit_opts)  # type: ignore[misc, arg-type]
   def _fn(*args, **kws):
     return fn_to_tune(*args, **dict(kws, **hyperparams))
 
   _fn.__name__ = TUNE_FN_PREFIX_FMT.format(name_id)
 
-  # return jax.jit(_fn, **jit_opts)
   return jit_wrapper(_fn)
 
 
@@ -191,7 +187,9 @@ def _experimental_time_with_profiler(
         _timing_closure()
 
     with Timer("Finding latest profile"):
-      unstruct_profile_files = [[r / f for f in fs if str(f).endswith(".xplane.pb")] for r, _, fs in profile_path.walk()]
+      unstruct_profile_files = [
+        [r / f for f in fs if str(f).endswith(".xplane.pb")] for r, _, fs in profile_path.walk()
+      ]
       profile_files = sum(unstruct_profile_files, [])
       profile_files = sorted(profile_files, key=lambda f: f.stat().st_mtime)
       if len(profile_files) == 0:
@@ -205,14 +203,15 @@ def _experimental_time_with_profiler(
       profile_events = profile_reader.get_events_from_plane(profile_proto, device_plane_id)
     with Timer("Extracting timing statistics"):
       fn_format = f"jit\\({TUNE_FN_PREFIX_FMT.format('([0-9]+)')}\\)"
-      function_timings = {
-        int(re.match(fn_format, k).group(1)): (
-          float(np.mean([repeat.duration for repeat in v])),
-          float(np.std([repeat.duration for repeat in v]))
-        )
-        for k, v in profile_events.items()
-        if re.match(fn_format, k)
-      }
+      function_timings = {}
+      for k, v in profile_events.items():
+        if not re.match(fn_format, k):
+          continue
+        key = int(re.match(fn_format, k).group(1))
+        durations = [repeat.duration for repeat in v]
+        if len(durations) > 1:
+          durations = sorted(durations)[: -max(round(0.2 * len(durations)), 1)]  # discard slowest / warmup
+        function_timings[key] = (float(np.mean(durations)), float(np.std(durations)))
     return function_timings
 
 
@@ -340,7 +339,7 @@ def tune(
       def _timing_closure():
         for i, hs in hs_pbar:
           hs = dict(zip(hyperparams_norm.keys(), hs))
-          _time_fn(lambda: fns[i](*args_val, **kws_val), repeat=10)
+          _time_fn(lambda: fns[i](*args_val, **kws_val), repeat=10, number=1)
 
       if len(jax.tree.leaves(args_val)) > 0:
         platform = list(jax.tree.leaves(args_val)[0].devices())[0].platform
