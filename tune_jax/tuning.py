@@ -15,6 +15,7 @@ import logging
 from pprint import pformat
 from pathlib import Path
 from warnings import warn
+import contextlib
 
 import jax
 import jax.core
@@ -25,7 +26,6 @@ from jax.sharding import PartitionSpec, Sharding, SingleDeviceSharding
 from jax.experimental.pallas.ops.gpu import attention
 import numpy as np
 from tqdm import tqdm
-
 
 try:
   from . import profile_reader
@@ -44,9 +44,23 @@ if not logger.handlers:
   handler = logging.StreamHandler()
   handler.setFormatter(logging.Formatter(logging.BASIC_FORMAT))
   logger.addHandler(handler)
-logger.setLevel(logging.DEBUG)
-context_escape_pool_executor = ThreadPoolExecutor(max_workers=8)
+logger.setLevel(logging.WARNING)
 
+
+_timer_indent = 0
+
+@contextlib.contextmanager
+def Timer(task_name: str):
+  global _timer_indent
+  _timer_indent += 2
+  __t = time.time()
+  try:
+    yield
+  finally:
+    _timer_indent -= 2
+    logger.debug(("  " * _timer_indent) + f"{task_name} took {time.time() - __t:.4e} s")
+
+context_escape_pool_executor = ThreadPoolExecutor(max_workers=8)
 _global_tuning_lock = threading.Lock()
 
 
@@ -169,31 +183,36 @@ def _experimental_time_with_profiler(
 ) -> dict[int, tuple[float, float]]:
   with tempfile.TemporaryDirectory(delete=False) as tempdir:
     profile_path = Path(tempdir).absolute()
-    logger.debug("Saving optimization profile to `%s`", profile_path)
+    logger.info("Saving optimization profile to `%s`", profile_path)
     profile_path.mkdir(exist_ok=True)
 
-    with jax.profiler.trace(str(profile_path)):
-      _timing_closure()
+    with Timer("Running the code to profile and generating the profile"):
+      with jax.profiler.trace(str(profile_path)):
+        _timing_closure()
 
-    unstruct_profile_files = [[r / f for f in fs if str(f).endswith(".xplane.pb")] for r, _, fs in profile_path.walk()]
-    profile_files = sum(unstruct_profile_files, [])
-    profile_files = sorted(profile_files, key=lambda f: f.stat().st_mtime)
-    if len(profile_files) == 0:
-      raise RuntimeError("No profile was created.")
-    latest_profile = profile_files[-1]
-    profile_proto = profile_reader.parse_profile_from_bytes(latest_profile.read_bytes())
-    device_plane_id = profile_reader.find_device_plane_ids(profile_proto, platform)[0]
-    profile_events = profile_reader.get_events_from_plane(profile_proto, device_plane_id)
-    profile_timing_trie = profile_reader.get_scopes_trie(profile_events)
-    fn_format = f"jit\\({TUNE_FN_PREFIX_FMT.format('([0-9]+)')}\\)"
-    function_timings = {
-      int(re.match(fn_format, k).group(1)): (
-        float(np.mean(v.durations)),
-        float(np.std(v.durations)),
-      )
-      for k, v in profile_timing_trie.items()
-      if re.match(fn_format, k)
-    }
+    with Timer("Finding latest profile"):
+      unstruct_profile_files = [[r / f for f in fs if str(f).endswith(".xplane.pb")] for r, _, fs in profile_path.walk()]
+      profile_files = sum(unstruct_profile_files, [])
+      profile_files = sorted(profile_files, key=lambda f: f.stat().st_mtime)
+      if len(profile_files) == 0:
+        raise RuntimeError("No profile was created.")
+      latest_profile = profile_files[-1]
+    with Timer("Parsing proto"):
+      profile_proto = profile_reader.parse_profile_from_bytes(latest_profile.read_bytes())
+    with Timer("Finding the device plane"):
+      device_plane_id = profile_reader.find_device_plane_ids(profile_proto, platform)[0]
+    with Timer("Parsing the events"):
+      profile_events = profile_reader.get_events_from_plane(profile_proto, device_plane_id)
+    with Timer("Extracting timing statistics"):
+      fn_format = f"jit\\({TUNE_FN_PREFIX_FMT.format('([0-9]+)')}\\)"
+      function_timings = {
+        int(re.match(fn_format, k).group(1)): (
+          float(np.mean([repeat.duration for repeat in v])),
+          float(np.std([repeat.duration for repeat in v]))
+        )
+        for k, v in profile_events.items()
+        if re.match(fn_format, k)
+      }
     return function_timings
 
 
@@ -206,6 +225,7 @@ def tune(
   device: jax.Device | _UnspecifiedT = UNSPECIFIED,
   example_args: tuple[Any] | None = None,
   example_kws: dict[Any, Any] | None = None,
+  store_timing_results: bool = True,
 ):
   """Tune a function with hyperparameters, even if some fail to compile.
 
@@ -218,6 +238,7 @@ def tune(
       device (jax.Device | _UnspecifiedT, optional): device to tune on if shardings are unspecified.
       example_args (tuple[Any] | None, optional): Exact example_args to tune with, on correct device.
       example_kws (dict[Any, Any] | None, optional): Exact example_kws to tune with, on correct device.
+      store_results (bool): Attach the timining results to the function handle (i.e., fn.timing_results)?
   """
 
   def _get_random_value(arr, sharding):
@@ -285,7 +306,7 @@ def tune(
         future_pbar = tqdm(
           compiles.items(),
           total=len(compiles),
-          disable=logger.level > logging.DEBUG,
+          disable=logger.level > logging.INFO,
           desc="Compiling...",
         )
         successful_compiles = {k: x.result() for (k, x) in future_pbar if x.result().status}
@@ -310,7 +331,7 @@ def tune(
     hs_pbar = tqdm(
       hyperparam_settings.items(),
       total=len(hyperparam_settings),
-      disable=logger.level > logging.DEBUG,
+      disable=logger.level > logging.INFO,
       desc="Timing...",
     )
 
@@ -325,13 +346,15 @@ def tune(
         platform = list(jax.tree.leaves(args_val)[0].devices())[0].platform
       else:
         platform = _get_default_device().platform
-      profiler_timings = _experimental_time_with_profiler(_timing_closure, platform)
+
+      with Timer("Profile all together"):
+        profiler_timings = _experimental_time_with_profiler(_timing_closure, platform)
       for i, hs in hs_pbar:
         hs = dict(zip(hyperparams_norm.keys(), hs))
         results[i] = TimingResult(hs, *profiler_timings[i])
     except Exception as _:
       # old timing fallback
-      logger.debug(traceback.format_exc())
+      logger.warning(traceback.format_exc())
       warn("Could not time with the profiler, falling back to Python-level timing")
       for i, hs in hs_pbar:
         hs = dict(zip(hyperparams_norm.keys(), hs))
@@ -339,17 +362,20 @@ def tune(
 
     results = sorted(results.items(), key=lambda x: _timing_loss(x[1]))
     idx, optimal_hyperparams = results[0][0], results[0][1].hyperparams
-    logger.debug(pformat(results))
-    logger.debug(f"optimal hyperparams: {optimal_hyperparams}")
+    logger.info("\n" + pformat(results, width=300))
+    logger.info(f"optimal hyperparams: {optimal_hyperparams}")
     return fns[idx], optimal_hyperparams, results
 
   @functools.wraps(fn_to_tune)
   def wrapped_fn(*args, **kws):
     with jax.core.eval_context():
       _, optimal_hyperparameters, results = _get_best_hyperparams(args, kws)
-    # wrapped_fn.timing_results = results
+    if store_timing_results:
+      wrapped_fn.timing_results.clear()
+      wrapped_fn.timing_results.update(results)
     return fn_to_tune(*args, **dict(kws, **optimal_hyperparameters))
 
+  wrapped_fn.timing_results = {}
   return wrapped_fn
 
 
@@ -400,6 +426,8 @@ def test_main():
   v = random.normal(random.key(0), (2 * b, kt, h, d), dtype=jnp.bfloat16)
   tuned_mha_jit(q, k, v, segment_ids=None).block_until_ready()
   tuned_mha_jit(q, k, v, segment_ids=None).block_until_ready()
+
+  print(tuned_mha_jit.timing_results)  # to get access to timing results
 
   return
 

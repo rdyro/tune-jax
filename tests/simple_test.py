@@ -73,6 +73,8 @@ def test_simple_mha():
   tuned_mha_jit(q, k, v, segment_ids=None).block_until_ready()
   tuned_mha_jit(q, k, v, segment_ids=None).block_until_ready()
 
+  print(tuned_mha_jit.timing_results)  # to get access to latest timing results
+
 
 @pytest.mark.skipif(not gpu_available(), reason="No GPU available")
 def test_multidevice():
@@ -93,7 +95,7 @@ def test_multidevice():
   k = random.normal(random.key(0), (b, kt, h, d), dtype=jnp.bfloat16)
   v = random.normal(random.key(0), (b, kt, h, d), dtype=jnp.bfloat16)
 
-  in_shardings = tuple(NamedSharding(mesh, P(*(["x"] + [None] * (z.ndim - 1)))) for z in [q, k, v])
+  in_shardings = [NamedSharding(mesh, P(*(["x"] + [None] * (z.ndim - 1)))) for z in [q, k, v]]
   q, k, v = jax.tree.map(lambda x, y: jax.device_put(x, y), [q, k, v], in_shardings)
 
   if hasattr(attention, "BlockSizes"):
@@ -117,6 +119,8 @@ def test_multidevice():
   v = random.normal(random.key(0), (2 * b, kt, h, d), dtype=jnp.bfloat16)
   tuned_mha_jit(q, k, v).block_until_ready()
   tuned_mha_jit(q, k, v).block_until_ready()
+
+  print(tuned_mha_jit.timing_results)  # to get access to latest timing results
 
 
 if __name__ == "__main__":

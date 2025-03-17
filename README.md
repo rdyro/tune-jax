@@ -35,11 +35,11 @@ from jax.experimental.pallas.ops.gpu import attention
 
 from tune_jax import tune, tune_logger
 
-tune_logger.setLevel("DEBUG")
+tune_logger.setLevel("INFO")
 
 hyperparams = {
-"block_q": [4, 8, 16, 32, 64, 128],
-"block_k": [4, 8, 16, 32, 64, 128],
+  "block_q": [4, 8, 16, 32, 64, 128],
+  "block_k": [4, 8, 16, 32, 64, 128],
 }
 
 b, qt, h, d = 8, 32, 8, 512
@@ -50,8 +50,8 @@ k = random.normal(random.key(0), (b, kt, h, d), dtype=jnp.bfloat16)
 v = random.normal(random.key(0), (b, kt, h, d), dtype=jnp.bfloat16)
 
 attention_wrapper = lambda *args, block_q=None, block_k=None, **kw: attention.mha(
-*args,
-**dict(kw, block_sizes=attention.BlockSizes(block_q=block_q, block_k=block_k)),
+  *args,
+  **dict(kw, block_sizes=attention.BlockSizes(block_q=block_q, block_k=block_k)),
 )
 
 tuned_mha = tune(attention_wrapper, hyperparams=hyperparams)
@@ -64,6 +64,8 @@ k = random.normal(random.key(0), (2 * b, kt, h, d), dtype=jnp.bfloat16)
 v = random.normal(random.key(0), (2 * b, kt, h, d), dtype=jnp.bfloat16)
 tuned_mha_jit(q, k, v, segment_ids=None).block_until_ready()
 tuned_mha_jit(q, k, v, segment_ids=None).block_until_ready()
+
+print(tuned_mha_jit.timing_results)  # to get access to latest timing results
 ```
 
 ## API
@@ -78,6 +80,7 @@ def tune(
   device: jax.Device | _UnspecifiedT = UNSPECIFIED,
   example_args: tuple[Any] | None = None,
   example_kws: dict[Any, Any] | None = None,
+  store_timing_results: bool = True,
 ):
   """Tune a function with hyperparameters, even if some fail to compile.
 
@@ -90,6 +93,7 @@ def tune(
       device (jax.Device | _UnspecifiedT, optional): device to tune on if shardings are unspecified.
       example_args (tuple[Any] | None, optional): Exact example_args to tune with, on correct device.
       example_kws (dict[Any, Any] | None, optional): Exact example_kws to tune with, on correct device.
+      store_timing_results (bool): Attach the timining results to the function handle (i.e., fn.timing_results)?
   """
 
   ...
