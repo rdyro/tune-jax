@@ -1,4 +1,5 @@
 import sys
+from typing import Any
 from pathlib import Path
 from pprint import pprint, pformat
 import dataclasses
@@ -33,6 +34,7 @@ def find_device_plane_ids(p: xplane_pb2.XSpace, device_str: str) -> list[int]:
 class ParsedEvent:
   name: str
   scopes: str
+  split_scopes: list[str | None]
   hlo_op: str
   hlo_module: str
   start: float  # in seconds
@@ -40,33 +42,56 @@ class ParsedEvent:
   duration: float  # in seconds
   correlation_id: int
   scope_range_id: int
+  program_id: int
+  raw_event: xplane_pb2.XEvent
+  stats: dict[str, Any] = dataclasses.field(default_factory=lambda: {})
+
+
+def _extract_stat(plane: xplane_pb2.XPlane, stats: list[xplane_pb2.XStat], name: str, attr_name: str):
+  valid_stats = [stat for stat in stats if plane.stat_metadata[stat.metadata_id].name == name]
+  return getattr(valid_stats[0], attr_name) if len(valid_stats) == 1 else None
 
 
 def _parse_event(plane, event) -> ParsedEvent:
   event_metadata = plane.event_metadata[event.metadata_id]
+  all_stats = list(event.stats) + list(event_metadata.stats)  # handle both GPU and TPU
+
+  # extract all reference stats
   ref_stats = {
     plane.stat_metadata[stat.metadata_id].name: plane.stat_metadata[stat.ref_value].name
-    for stat in event.stats
+    for stat in all_stats
     if stat.ref_value
   }
-  correlation_id = [
-    stat.uint64_value for stat in event.stats if plane.stat_metadata[stat.metadata_id].name == "correlation_id"
-  ]
-  correlation_id = None if len(correlation_id) != 1 else correlation_id[0]
-  scope_range_id = [
-    stat.int64_value for stat in event.stats if plane.stat_metadata[stat.metadata_id].name == "scope_range_id"
-  ]
-  scope_range_id = None if len(scope_range_id) != 1 else scope_range_id[0]
+
+  correlation_id = _extract_stat(plane, all_stats, "correlation_id", "uint64_value")
+  scope_range_id = _extract_stat(plane, all_stats, "scope_range_id", "int64_value")
+  program_id = _extract_stat(plane, all_stats, "program_id", "int64_value")
+
+  # on TPU scopes and hlo_op live in event_metadata instead
+  hlo_op_tpu_fallback = event_metadata.display_name
+  scopes_tpu_fallback = _extract_stat(plane, all_stats, "tf_op", "str_value")
+
+  scopes = ref_stats.get("name", scopes_tpu_fallback)
+  scope_delim = "/"
+  if scopes is not None and scope_delim in scopes:
+    split_scopes = scopes.split(scope_delim)
+  else:
+    split_scopes = [None]
+
   parsed_event = ParsedEvent(
     name=event_metadata.name,
-    scopes=ref_stats.get("name", None),
-    hlo_op=ref_stats.get("hlo_op", None),
+    scopes=scopes,
+    split_scopes=split_scopes,
+    hlo_op=ref_stats.get("hlo_op", hlo_op_tpu_fallback),
     hlo_module=ref_stats.get("hlo_module", None),
     start=event.offset_ps / 1e12,
     end=(event.offset_ps + event.duration_ps) / 1e12,
     duration=event.duration_ps / 1e12,
     correlation_id=correlation_id,
     scope_range_id=scope_range_id,
+    program_id=program_id,
+    raw_event=event,
+    stats=ref_stats,
   )
   return parsed_event
 
@@ -121,38 +146,58 @@ def _combine_scope_children_times(event_tree: EventScopeNode) -> tuple[float, fl
   return (event_tree.start, event_tree.end, event_tree.duration)
 
 
-def get_events_from_plane(p: xplane_pb2.XSpace, plane_idx: int) -> dict[str, list[EventScopeNode]]:
+def _is_new_scope(prev_parsed_event: ParsedEvent, parsed_event: ParsedEvent, splitter_op_id: str):
+  if prev_parsed_event is None:
+    return False
+  new_top_level_scope = prev_parsed_event.split_scopes[0] != parsed_event.split_scopes[0]
+  splitter_op_hit = f"{parsed_event.scopes}-{parsed_event.hlo_op}" == splitter_op_id
+  return new_top_level_scope or splitter_op_hit
+
+
+def get_events_from_plane(
+  p: xplane_pb2.XSpace, plane_idx: int, verbose: bool = True
+) -> dict[str, list[EventScopeNode]]:
   """Get a dictionary of top level scope events. Because they can repeat, aggregate them in a list.
 
   Use :func:`find_device_plane_ids` to find the plane indices of planes corresponding to an accelerator.
   """
+  if verbose:
+    from tqdm import tqdm
+  else:
+    tqdm = lambda *args, **kw: args[0]
+
   plane = p.planes[plane_idx]
-  all_events = {}
-  for line in plane.lines:
-    prev_root_key, prev_scope_range_id = None, None
-    running_event = EventScopeNode()  # running event is a top level named-scope/jit-function
-    for _, event in enumerate(line.events):
-      parsed_event = _parse_event(plane, event)
-      keys = parsed_event.scopes.split("/") if parsed_event.scopes is not None else [parsed_event.name]
+  all_raw_events = [(line_id, event) for line_id, line in enumerate(plane.lines) for event in line.events]
+  all_parsed_events = [
+    (line_id, _parse_event(plane, event)) for line_id, event in tqdm(all_raw_events, desc="Parsing events")
+  ]
+  all_parsed_events = [
+    (line_id, parsed_event) for line_id, parsed_event in all_parsed_events if parsed_event.split_scopes[0] is not None
+  ]
+  all_parsed_events = sorted(
+    all_parsed_events, key=lambda x: x[1].correlation_id if x[1].correlation_id is not None else int(1e20)
+  )
 
-      if (prev_root_key is not None and prev_root_key != keys[0]) or (
-        prev_scope_range_id is not None and abs(prev_scope_range_id - parsed_event.scope_range_id) > 1
-      ):
-        # when the top level name changes or scope_range_id jumps by more than 1
-        # we need to aggregate time and save the complete event
-        _combine_scope_children_times(running_event)
-        assert len(running_event.children) == 1  # we should have accumulated exactly 1 root event
-        event_node = list(running_event.children.values())[0]
+  all_events, prev_parsed_event, splitter_op_id, running_event = {}, None, None, EventScopeNode()
+  for line_id, parsed_event in tqdm(all_parsed_events, desc="Aggregating scopes"):
+    del line_id
+    op_id = f"{parsed_event.scopes}-{parsed_event.hlo_op}"
+
+    # potentially terminate a scope
+    if _is_new_scope(prev_parsed_event, parsed_event, splitter_op_id):
+      _combine_scope_children_times(running_event)
+      for event_node in running_event.children.values():
         all_events.setdefault(event_node.name, []).append(event_node)
-        running_event = EventScopeNode()
+      running_event, splitter_op_id = EventScopeNode(), op_id
 
-      _insert_event_into_scope_tree(running_event, parsed_event, keys)
-      prev_root_key, prev_scope_range_id = keys[0], parsed_event.scope_range_id
+    # update the prev_parsed_event and splitter_op_id
+    splitter_op_id = op_id if splitter_op_id is None else splitter_op_id
+    prev_parsed_event = parsed_event
+    _insert_event_into_scope_tree(running_event, parsed_event, parsed_event.split_scopes)
 
-    # finally, combine the last running event and save it
-    _combine_scope_children_times(running_event)
-    assert len(running_event.children) == 1  # we should have accumulated exactly 1 root event
-    event_node = list(running_event.children.values())[0]
+  # finally, combine the last running event and save it
+  _combine_scope_children_times(running_event)
+  for event_node in running_event.children.values():
     all_events.setdefault(event_node.name, []).append(event_node)
   return all_events
 

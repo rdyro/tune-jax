@@ -175,7 +175,7 @@ def _normalize_sharding(
 
 
 def _experimental_time_with_profiler(
-  _timing_closure: Callable[[], None], platform: str
+  _timing_closure: Callable[[], None], platform: str, total_calls_number: int = 0
 ) -> dict[int, tuple[float, float]]:
   with tempfile.TemporaryDirectory(delete=False) as tempdir:
     profile_path = Path(tempdir).absolute()
@@ -187,11 +187,7 @@ def _experimental_time_with_profiler(
         _timing_closure()
 
     with Timer("Finding latest profile"):
-      unstruct_profile_files = [
-        [r / f for f in fs if str(f).endswith(".xplane.pb")] for r, _, fs in profile_path.walk()
-      ]
-      profile_files = sum(unstruct_profile_files, [])
-      profile_files = sorted(profile_files, key=lambda f: f.stat().st_mtime)
+      profile_files = sorted(profile_path.glob("**/*.xplane.pb"), key=lambda f: f.stat().st_mtime)
       if len(profile_files) == 0:
         raise RuntimeError("No profile was created.")
       latest_profile = profile_files[-1]
@@ -200,7 +196,7 @@ def _experimental_time_with_profiler(
     with Timer("Finding the device plane"):
       device_plane_id = profile_reader.find_device_plane_ids(profile_proto, platform)[0]
     with Timer("Parsing the events"):
-      profile_events = profile_reader.get_events_from_plane(profile_proto, device_plane_id)
+      profile_events = profile_reader.get_events_from_plane(profile_proto, device_plane_id, verbose=False)
     with Timer("Extracting timing statistics"):
       fn_format = f"jit\\({TUNE_FN_PREFIX_FMT.format('([0-9]+)')}\\)"
       function_timings = {}
@@ -209,6 +205,11 @@ def _experimental_time_with_profiler(
           continue
         key = int(re.match(fn_format, k).group(1))
         durations = [repeat.duration for repeat in v]
+        if total_calls_number > 0:
+          if total_calls_number != len(durations):
+            raise RuntimeError(
+              f"Obtained different number of scopes than expected. Expected {total_calls_number} vs {len(durations)}"
+            )
         if len(durations) > 1:
           durations = sorted(durations)[: -max(round(0.2 * len(durations)), 1)]  # discard slowest / warmup
         function_timings[key] = (float(np.mean(durations)), float(np.std(durations)))
@@ -335,11 +336,12 @@ def tune(
     )
 
     try:
+      repeats = 10
 
       def _timing_closure():
         for i, hs in hs_pbar:
           hs = dict(zip(hyperparams_norm.keys(), hs))
-          _time_fn(lambda: fns[i](*args_val, **kws_val), repeat=10, number=1)
+          _time_fn(lambda: fns[i](*args_val, **kws_val), repeat=repeats, number=1)
 
       if len(jax.tree.leaves(args_val)) > 0:
         platform = list(jax.tree.leaves(args_val)[0].devices())[0].platform
@@ -347,7 +349,7 @@ def tune(
         platform = _get_default_device().platform
 
       with Timer("Profile all together"):
-        profiler_timings = _experimental_time_with_profiler(_timing_closure, platform)
+        profiler_timings = _experimental_time_with_profiler(_timing_closure, platform, total_calls_number=repeats)
       for i, hs in hs_pbar:
         hs = dict(zip(hyperparams_norm.keys(), hs))
         results[i] = TimingResult(hs, *profiler_timings[i])
@@ -402,6 +404,8 @@ def test_main():
 
   tuned_mha = tune(attention_wrapper, hyperparams=hyperparams)
   tuned_mha_jit = jax.jit(tuned_mha)
+
+  logger.setLevel("DEBUG")
 
   if False:
 
