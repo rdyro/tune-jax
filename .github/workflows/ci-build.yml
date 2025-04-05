@@ -58,7 +58,7 @@ jobs:
         run: |
           uv venv --seed ~/.venv
           source ~/.venv/bin/activate
-          uv pip install pytest && pip install pytest
+          uv pip install pytest absl-py && pip install pytest
           uv pip install .
       - name: Run tests
         run: |
