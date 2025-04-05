@@ -146,16 +146,16 @@ def _combine_scope_children_times(event_tree: EventScopeNode) -> tuple[float, fl
   return (event_tree.start, event_tree.end, event_tree.duration)
 
 
-def _is_new_scope(prev_parsed_event: ParsedEvent, parsed_event: ParsedEvent, splitter_op_id: str):
+def _is_new_scope(prev_parsed_event: ParsedEvent, parsed_event: ParsedEvent, splitter_op_id: str, op_id: str):
   if prev_parsed_event is None:
     return False
   new_top_level_scope = prev_parsed_event.split_scopes[0] != parsed_event.split_scopes[0]
-  splitter_op_hit = f"{parsed_event.scopes}-{parsed_event.hlo_op}" == splitter_op_id
+  splitter_op_hit = op_id == splitter_op_id
   return new_top_level_scope or splitter_op_hit
 
 
 def get_events_from_plane(
-  p: xplane_pb2.XSpace, plane_idx: int, verbose: bool = True
+  p: xplane_pb2.XSpace, plane_idx: int, verbose: bool = True, aggressive_splitting: bool = False
 ) -> dict[str, list[EventScopeNode]]:
   """Get a dictionary of top level scope events. Because they can repeat, aggregate them in a list.
 
@@ -181,10 +181,14 @@ def get_events_from_plane(
   all_events, prev_parsed_event, splitter_op_id, running_event = {}, None, None, EventScopeNode()
   for line_id, parsed_event in tqdm(all_parsed_events, desc="Aggregating scopes"):
     del line_id
-    op_id = f"{parsed_event.scopes}-{parsed_event.hlo_op}"
+    if aggressive_splitting:
+      hlo_op = parsed_event.hlo_op if "." not in parsed_event.hlo_op else ".".join(parsed_event.hlo_op.split(".")[:-1])
+      op_id = f"{parsed_event.scopes}-{hlo_op}"
+    else:
+      op_id = f"{parsed_event.scopes}-{parsed_event.hlo_op}"
 
     # potentially terminate a scope
-    if _is_new_scope(prev_parsed_event, parsed_event, splitter_op_id):
+    if _is_new_scope(prev_parsed_event, parsed_event, splitter_op_id, op_id):
       _combine_scope_children_times(running_event)
       for event_node in running_event.children.values():
         all_events.setdefault(event_node.name, []).append(event_node)
