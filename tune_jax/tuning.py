@@ -15,7 +15,7 @@ import logging
 from pprint import pformat
 from pathlib import Path
 from warnings import warn
-import contextlib
+import random as pyrandom
 
 import jax
 import jax.core
@@ -39,28 +39,20 @@ __all__ = ["tune"]
 
 TUNE_FN_PREFIX_FMT = "tune_jax_fn_{}"
 
+
+@dataclasses.dataclass
+class _Config:
+  allow_fallback_timing: bool = True
+
+
+CONFIG = _Config()
+
 logger = logging.getLogger("tune_jax")
 if not logger.handlers:
   handler = logging.StreamHandler()
   handler.setFormatter(logging.Formatter(logging.BASIC_FORMAT))
   logger.addHandler(handler)
 logger.setLevel(logging.WARNING)
-
-
-_timer_indent = 0
-
-
-@contextlib.contextmanager
-def Timer(task_name: str):
-  global _timer_indent
-  _timer_indent += 2
-  __t = time.time()
-  try:
-    yield
-  finally:
-    _timer_indent -= 2
-    logger.debug(("  " * _timer_indent) + f"{task_name} took {time.time() - __t:.4e} s")
-
 
 context_escape_pool_executor = ThreadPoolExecutor(max_workers=8)
 _global_tuning_lock = threading.Lock()
@@ -101,10 +93,7 @@ def _get_default_device():
 def _try_call(fn: Callable[[], None]) -> CompileResult:
   """Attempt to call the function and return whether it compiles and runs."""
   try:
-    _ = jax.tree.map(
-      lambda x: getattr(x, "block_until_ready", lambda: x)(),
-      fn(),  # type: ignore
-    )
+    _ = jax.tree.map(lambda x: getattr(x, "block_until_ready", lambda: x)(), fn())
     return CompileResult(True, None)
   except Exception as _:
     msg = traceback.format_exc()
@@ -113,7 +102,7 @@ def _try_call(fn: Callable[[], None]) -> CompileResult:
 
 def _time_fn(fn: Callable[[], None], repeat: int = 5, number: int = 3) -> tuple[float, float]:
   """Time a function in a global single-threaded lock, so system is unloaded."""
-  assert repeat >= 2, f"{repeat = } must be >= 2, we discard slowest result."
+  # assert repeat >= 2, f"{repeat = } must be >= 2, we discard slowest result."
   with _global_tuning_lock:
 
     def _blocked_call():
@@ -128,7 +117,7 @@ def _time_fn(fn: Callable[[], None], repeat: int = 5, number: int = 3) -> tuple[
     # in seconds
     times = np.diff(np.array([start] + times_raw) - start) / number
 
-    sorted_times = np.sort(times)[:-1]  # drop the slowest time
+    sorted_times = np.sort(times)[:-1] if repeat > 1 else np.sort(times)  # maybe drop the slowest time
     t_mean, t_std = np.mean(sorted_times), np.std(sorted_times)
     return float(t_mean), float(t_std)
 
@@ -175,45 +164,67 @@ def _normalize_sharding(
 
 
 def _experimental_time_with_profiler(
-  _timing_closure: Callable[[], None], platform: str, total_calls_number: int = 0
+  _timing_closure: Callable[[], None], platform: str, total_calls_number: int
 ) -> dict[int, tuple[float, float]]:
-  with tempfile.TemporaryDirectory(delete=False) as tempdir:
-    profile_path = Path(tempdir).absolute()
-    logger.info("Saving optimization profile to `%s`", profile_path)
-    profile_path.mkdir(exist_ok=True)
-
-    with Timer("Running the code to profile and generating the profile"):
+  function_timings = {}
+  for it in tqdm(range(total_calls_number), desc=f"Profiling {platform}"):
+    with tempfile.TemporaryDirectory(prefix="tuning_profile_", delete=False) as tempdir:
+      profile_path = Path(tempdir).absolute()
+      if it == 0:
+        logger.info("Saving optimization profile to `%s`", profile_path)
+      profile_path.mkdir(exist_ok=True)
       with jax.profiler.trace(str(profile_path)):
-        _timing_closure()
-
-    with Timer("Finding latest profile"):
+        _timing_closure(1)
       profile_files = sorted(profile_path.glob("**/*.xplane.pb"), key=lambda f: f.stat().st_mtime)
       if len(profile_files) == 0:
         raise RuntimeError("No profile was created.")
       latest_profile = profile_files[-1]
-    with Timer("Parsing proto"):
       profile_proto = profile_reader.parse_profile_from_bytes(latest_profile.read_bytes())
-    with Timer("Finding the device plane"):
       device_plane_id = profile_reader.find_device_plane_ids(profile_proto, platform)[0]
-    with Timer("Parsing the events"):
       profile_events = profile_reader.get_events_from_plane(profile_proto, device_plane_id, verbose=False)
-    with Timer("Extracting timing statistics"):
-      fn_format = f"jit\\({TUNE_FN_PREFIX_FMT.format('([0-9]+)')}\\)"
-      function_timings = {}
-      for k, v in profile_events.items():
+      fn_format = f"jit_{TUNE_FN_PREFIX_FMT.format('([0-9]+)')}.*"
+      for k, durations in profile_events.items():
         if not re.match(fn_format, k):
           continue
         key = int(re.match(fn_format, k).group(1))
-        durations = [repeat.duration for repeat in v]
-        if total_calls_number > 0:
-          if total_calls_number != len(durations):
-            raise RuntimeError(
-              f"Obtained different number of scopes than expected. Expected {total_calls_number} vs {len(durations)}"
-            )
-        if len(durations) > 1:
-          durations = sorted(durations)[: -max(round(0.2 * len(durations)), 1)]  # discard slowest / warmup
-        function_timings[key] = (float(np.mean(durations)), float(np.std(durations)))
-    return function_timings
+        assert len(durations) == 1, "We are expecting a single call per profile"
+        function_timings.setdefault(key, []).extend(durations)
+
+  for key, durations in function_timings.items():
+    if len(durations) > 2:
+      durations = sorted(durations)[1:-1]  # discard slowest and fastest
+    function_timings[key] = (float(np.mean(durations)), float(np.std(durations)))
+
+  return function_timings
+
+
+@functools.partial(jax.jit, static_argnames=("sds", "sharding"))
+def _get_random_value(sds, sharding):
+  """Random values based on the tracer shape and dtype, and the sharding."""
+
+  if hasattr(sds, "shape") and hasattr(sds, "dtype"):
+    if jnp.issubdtype(sds.dtype, jnp.floating):
+      return jax.jit(lambda key: random.normal(key, sds.shape, sds.dtype), out_shardings=sharding)(random.key(0))
+    elif jnp.issubdtype(sds.dtype, jnp.integer):
+      return jax.jit(lambda: jnp.zeros(sds.shape, sds.dtype), out_shardings=sharding)()
+    else:
+      raise ValueError(f"Unsupported dtype {sds.dtype}")
+  else:
+    return sds
+
+
+def _try_hash_input(args, kws):
+  """For eager mode tunable, hash the shape, dtype and sharding of the inputs."""
+
+  flat_vals, struct = jax.tree.flatten((args, kws))
+  all_concrete = all(jax.core.is_concrete(x) for x in flat_vals if isinstance(x, jax.Array))
+  if not all_concrete:
+    return None
+  array_to_hashable = lambda x: x if not isinstance(x, jax.Array) else hash((jax.typeof(x), x.sharding))
+  try:
+    return hash((struct, tuple(array_to_hashable(x) for x in flat_vals)))
+  except:
+    return None
 
 
 def tune(
@@ -241,26 +252,15 @@ def tune(
       store_results (bool): Attach the timining results to the function handle (i.e., fn.timing_results)?
   """
 
-  def _get_random_value(arr, sharding):
-    """Random values based on the tracer shape and dtype, and the sharding."""
-
-    # TODO(rdyro): these values get initialized on the default device before
-    # being moved to the correct sharding, maybe use direct on-device generation
-    if isinstance(arr, jax.Array):
-      if jnp.issubdtype(arr.dtype, jnp.floating):
-        return jax.device_put(random.normal(random.key(0), arr.shape, dtype=arr.dtype), sharding)
-      elif jnp.issubdtype(arr.dtype, jnp.integer):
-        return jax.device_put(np.zeros(arr.shape, dtype=arr.dtype), sharding)
-      else:
-        raise ValueError(f"Unsupported dtype {arr.dtype}")
-    else:
-      return arr
-
   def _get_best_hyperparams(args, kws):
     """Main tuning method."""
 
     # resolve sharding and/or device placement #################################
-    if example_args is not None:
+    if len(args) == 0 or all(x is None or jax.core.is_concrete(x) for x in jax.tree.leaves(args)):
+      logger.info("All arguments are concrete, no need to pick random values.")
+      args_val = args
+    elif example_args is not None:
+      logger.info("Example arguments provided")
       args_val = example_args
       if in_shardings is not UNSPECIFIED or device is not UNSPECIFIED:
         raise ValueError(
@@ -269,10 +269,8 @@ def tune(
           " sharded."
         )
     else:
-      if isinstance(device, jax.Device):
-        resolved_device = device
-      else:
-        resolved_device = _get_default_device()
+      logger.info("Selecting random input arguments.")
+      resolved_device = device if isinstance(device, jax.Device) else _get_default_device()
       shardings = in_shardings if in_shardings is not UNSPECIFIED else jax.tree.map(lambda _: None, args)
       shardings = (shardings,) if len(args) == 1 else shardings
       shardings = jax.tree.map(
@@ -280,12 +278,18 @@ def tune(
         tuple(args),
         tuple(shardings),
       )
-      args_val = jax.tree.map(_get_random_value, args, shardings)
+      _maybe_aval = lambda x: x if not isinstance(x, jax.Array) else x.aval
+      args_val = jax.tree.map(lambda x, s: _get_random_value(_maybe_aval(x), s), args, shardings)
 
-    if example_kws is not None:
+    if len(kws) == 0 or all(v is None or jax.core.is_concrete(v) for v in kws.values()):
+      logger.info("All keyword arguments are concrete, no need to pick random values.")
+      kws_val = kws
+    elif example_kws is not None:
+      logger.info("Example keyword arguments provided")
       kws_val = example_kws
     else:
-      kws_val = jax.tree.map(_get_random_value, kws)
+      logger.info("Selecting random keyword arguments.")
+      kws_val = jax.tree.map(lambda x: _get_random_value(_maybe_aval(x)), kws)
 
     hyperparams_norm = {k: (v if isinstance(v, (tuple, list)) else (v,)) for k, v in hyperparams.items()}
     executor = ThreadPoolExecutor(max_workers=max_workers)
@@ -295,9 +299,7 @@ def tune(
 
     with _global_tuning_lock:
       # filter hyperparameters for those that compile ##########################
-      # repeat until the number stabilizes
-      # sometimes a kernel compiles once, but not twice
-      while True:
+      for _ in range(2):  # sometimes a kernel compiles once, but not twice
         compiles: dict[int, Future[CompileResult]] = dict()
         for i, kws in hyperparam_settings.items():
           hs = dict(zip(hyperparams_norm.keys(), kws))
@@ -328,18 +330,13 @@ def tune(
     # sequentially time the remaining hyperparameters ##########################
     # the _time_fn will acquire the lock on its own
     results = dict()
-    hs_pbar = tqdm(
-      hyperparam_settings.items(),
-      total=len(hyperparam_settings),
-      disable=logger.level > logging.INFO,
-      desc="Timing...",
-    )
-
     try:
-      repeats = 10
+      repeats = 5
 
-      def _timing_closure():
-        for i, hs in hs_pbar:
+      def _timing_closure(repeats: int):
+        hs = list(hyperparam_settings.items())
+        pyrandom.shuffle(hs)
+        for i, hs in hs:
           hs = dict(zip(hyperparams_norm.keys(), hs))
           _time_fn(lambda: fns[i](*args_val, **kws_val), repeat=repeats, number=1)
 
@@ -348,15 +345,18 @@ def tune(
       else:
         platform = _get_default_device().platform
 
-      with Timer("Profile all together"):
-        profiler_timings = _experimental_time_with_profiler(_timing_closure, platform, total_calls_number=repeats)
-      for i, hs in hs_pbar:
+      profiler_timings = _experimental_time_with_profiler(_timing_closure, platform, total_calls_number=repeats)
+      for i, hs in hyperparam_settings.items():
         hs = dict(zip(hyperparams_norm.keys(), hs))
         results[i] = TimingResult(hs, *profiler_timings[i])
     except Exception as _:
+      if not CONFIG.allow_fallback_timing:
+        raise RuntimeError(f"Need to fall back to the python-level timing, but {CONFIG=} prohibits it.")
       # old timing fallback
       logger.warning(traceback.format_exc())
       warn("Could not time with the profiler, falling back to Python-level timing")
+      _opts = dict(total=len(hyperparam_settings), disable=logger.level > logging.INFO, desc="Timing...")
+      hs_pbar = tqdm(hyperparam_settings.items(), **_opts)
       for i, hs in hs_pbar:
         hs = dict(zip(hyperparams_norm.keys(), hs))
         results[i] = TimingResult(hs, *_time_fn(lambda: fns[i](*args_val, **kws_val), repeat=10))
@@ -369,14 +369,21 @@ def tune(
 
   @functools.wraps(fn_to_tune)
   def wrapped_fn(*args, **kws):
-    with jax.core.eval_context():
-      _, optimal_hyperparameters, results = _get_best_hyperparams(args, kws)
+    maybe_hash = _try_hash_input(args, kws)
+    if maybe_hash is not None and maybe_hash in wrapped_fn.hyperparams_cache:
+      optimal_hyperparameters, results = wrapped_fn.hyperparams_cache[maybe_hash]
+    else:
+      with jax.core.eval_context():
+        _, optimal_hyperparameters, results = _get_best_hyperparams(args, kws)
+      if maybe_hash is not None:
+        wrapped_fn.hyperparams_cache[maybe_hash] = (optimal_hyperparameters, results)
     if store_timing_results:
       wrapped_fn.timing_results.clear()
       wrapped_fn.timing_results.update(results)
     return fn_to_tune(*args, **dict(kws, **optimal_hyperparameters))
 
   wrapped_fn.timing_results = {}
+  wrapped_fn.hyperparams_cache = {}
   return wrapped_fn
 
 

@@ -1,6 +1,6 @@
 [project]
 name = "tune_jax"
-version = "0.3.1"
+version = "0.4.0"
 authors = [{ name = "Robert Dyro" }]
 dependencies = ["jax", "numpy", "tqdm", "protobuf"]
 description = "Microbenchmarking hyperparameter tuning for JAX functions."
@@ -23,67 +23,15 @@ line-length = 120
 indent-width = 2
 target-version = "py310"
 
-[tool.mypy]
-show_error_codes = true
-disable_error_code = "attr-defined, name-defined, annotation-unchecked"
-no_implicit_optional = true
-warn_redundant_casts = true
-
-[[tool.mypy.overrides]]
-module = [
-    "IPython.*",
-    "absl.*",
-    "colorama.*",
-    "etils.*",
-    "filelock.*",
-    "flatbuffers.*",
-    "flax.*",
-    "google.colab.*",
-    "hypothesis.*",
-    "jax.experimental.jax2tf.tests.back_compat_testdata",
-    "jax.experimental.jax2tf.tests.flax_models",
-    "jax_cuda12_plugin.*",
-    "jaxlib.*",
-    "jaxlib.mlir.*",
-    "jraph.*",
-    "libtpu.*",
-    "matplotlib.*",
-    "nvidia.*",
-    "numpy.*",
-    "opt_einsum.*",
-    "optax.*",
-    "pygments.*",
-    "pytest.*",
-    "rich.*",
-    "scipy.*",
-    "setuptools.*",
-    "tensorboard_plugin_profile.convert.*",
-    "tensorflow.*",
-    "tensorflow.io.*",
-    "tensorflowjs.*",
-    "tensorstore.*",
-    "web_pdb.*",
-    "zstandard.*",
-    "kubernetes.*"
-]
-ignore_missing_imports = true
-
 [tool.ruff.lint]
 ignore = [
-    # Unnecessary collection call
-    "C408",
-    # Unnecessary map usage
-    "C417",
-    # Unnecessary dict comprehension for iterable
-    "C420",
-    # Object names too complex
-    "C901",
-    # Local variable is assigned to but never used
-    "F841",
-    # Raise with from clause inside except block
-    "B904",
-    # Zip without explicit strict parameter
-    "B905",
+    "C408",  # Unnecessary collection call
+    "C417",  # Unnecessary map usage
+    "C420",  # Unnecessary dict comprehension for iterable
+    "C901",  # Object names too complex
+    "F841",  # Local variable is assigned to but never used
+    "B904",  # Raise with from clause inside except block
+    "B905",  # Zip without explicit strict parameter
 ]
 select = [
     "B9",
@@ -101,6 +49,3 @@ select = [
     "E227",
     "E228",
 ]
-
-[tool.ruff.lint.mccabe]
-max-complexity = 18

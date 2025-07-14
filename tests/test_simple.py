@@ -12,12 +12,14 @@ from tune_jax import tune, tune_logger
 tune_logger.setLevel("DEBUG")
 
 
-def gpu_available():
-  try:
-    jax.devices("cuda")
-    return True
-  except:
-    return False
+def platforms_available(*platforms):
+  for platform in platforms:
+    try:
+      jax.devices(platform)
+      return True
+    except:
+      pass
+  return False
 
 
 def test_matmul_size():
@@ -41,7 +43,7 @@ def test_matmul_size():
   assert C.shape[-1] == min(hyperparams["n"])
 
 
-@pytest.mark.skipif(not gpu_available(), reason="No GPU available")
+@pytest.mark.skipif(not platforms_available("gpu"), reason="No GPU available")
 def test_simple_mha():
   hyperparams = {
     "block_q": [4, 8, 16, 32, 64, 128],
@@ -60,9 +62,10 @@ def test_simple_mha():
       *args,
       **dict(kw, block_sizes=attention.BlockSizes(block_q=block_q, block_k=block_k)),
     )
-    tuned_mha = tune(attention_wrapper, hyperparams=hyperparams)
+    attention_fn = attention_wrapper
   else:  # jax < 0.5.2
-    tuned_mha = tune(attention.mha, hyperparams=hyperparams)
+    attention_fn = attention.mha
+  tuned_mha = tune(jax.jit(attention_fn, static_argnames=("block_q", "block_k")), hyperparams=hyperparams)
   tuned_mha_jit = jax.jit(tuned_mha)
 
   tuned_mha_jit(q, k, v, segment_ids=None).block_until_ready()
@@ -76,7 +79,7 @@ def test_simple_mha():
   print(tuned_mha_jit.timing_results)  # to get access to latest timing results
 
 
-@pytest.mark.skipif(not gpu_available(), reason="No GPU available")
+@pytest.mark.skipif(not platforms_available("gpu"), reason="No GPU available")
 def test_multidevice():
   hyperparams = {
     "block_q": [4, 8, 16, 32, 64, 128],
@@ -125,5 +128,6 @@ def test_multidevice():
 
 if __name__ == "__main__":
   test_matmul_size()
-  test_simple_mha()
-  test_multidevice()
+  if platforms_available("gpu"):
+    test_multidevice()
+    test_simple_mha()
