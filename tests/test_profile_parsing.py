@@ -2,7 +2,7 @@ import jax
 from jax import numpy as jnp
 from jax import random
 from jax.experimental.pallas.ops.gpu import attention as attention_gpu
-import pytest
+from absl.testing import absltest
 
 from tune_jax import tune, tune_logger
 from tune_jax import tuning
@@ -49,39 +49,40 @@ def _long_while(it, x, y):
 
 ####################################################################################################
 
+class ProfileReadingTest(absltest.TestCase):
+  def test_parsing_multiple_profiles_on_gpu(self):
+    if not platforms_available("gpu", "tpu"):
+      self.skipTest("No GPU or TPU available")
+    try:
+      tuning.CONFIG.allow_fallback_timing = False
+      hyperparams = {
+        "block_q": [4, 8, 16, 32, 64, 128],
+        "block_k": [4, 8, 16, 32, 64, 128],
+      }
+      b, qt, h, d, kt = 8, 32, 8, 512, 128
+      q = random.normal(random.key(0), (b, qt, h, d), dtype=jnp.bfloat16)
+      k = random.normal(random.key(1), (b, kt, h, d), dtype=jnp.bfloat16)
+      v = random.normal(random.key(2), (b, kt, h, d), dtype=jnp.bfloat16)
+      if platforms_available("gpu"):
+        tune(_gpu_attention, hyperparams=hyperparams)(q, k, v).block_until_ready()
+        jax.jit(tune(_gpu_attention, hyperparams=hyperparams))(q, k, v).block_until_ready()
 
-@pytest.mark.skipif(not platforms_available("gpu", "tpu"), reason="No GPU/TPU available")
-def test_parsing_multiple_profiles_on_gpu():
-  try:
-    tuning.CONFIG.allow_fallback_timing = False
-    hyperparams = {
-      "block_q": [4, 8, 16, 32, 64, 128],
-      "block_k": [4, 8, 16, 32, 64, 128],
-    }
-    b, qt, h, d, kt = 8, 32, 8, 512, 128
-    q = random.normal(random.key(0), (b, qt, h, d), dtype=jnp.bfloat16)
-    k = random.normal(random.key(1), (b, kt, h, d), dtype=jnp.bfloat16)
-    v = random.normal(random.key(2), (b, kt, h, d), dtype=jnp.bfloat16)
-    if platforms_available("gpu"):
-      tune(_gpu_attention, hyperparams=hyperparams)(q, k, v).block_until_ready()
-      jax.jit(tune(_gpu_attention, hyperparams=hyperparams))(q, k, v).block_until_ready()
+      x = random.normal(random.key(0), (1024, 1024), dtype=jnp.bfloat16)
+      y = random.normal(random.key(1), (1024, 1024), dtype=jnp.bfloat16)
 
-    x = random.normal(random.key(0), (1024, 1024), dtype=jnp.bfloat16)
-    y = random.normal(random.key(1), (1024, 1024), dtype=jnp.bfloat16)
+      tune(_matmul, hyperparams={"dummy": [1]})(x, y)
+      jax.jit(tune(_matmul, hyperparams={"dummy": [1]}))(x, y)
 
-    tune(_matmul, hyperparams={"dummy": [1]})(x, y)
-    jax.jit(tune(_matmul, hyperparams={"dummy": [1]}))(x, y)
+      _fn = lambda x, y, c: _cond_fn(c, lambda x, y: x @ y, lambda x, y: x + y, x, y)
+      tune(_fn, hyperparams={"c": [0, 1, 2]})(x, y)
+      jax.jit(tune(_fn, hyperparams={"c": [0, 1, 2]}))(x, y)
 
-    _fn = lambda x, y, c: _cond_fn(c, lambda x, y: x @ y, lambda x, y: x + y, x, y)
-    tune(_fn, hyperparams={"c": [0, 1, 2]})(x, y)
-    jax.jit(tune(_fn, hyperparams={"c": [0, 1, 2]}))(x, y)
-
-    _fn = lambda x, y, it: _long_while(it, x, y)
-    tune(_fn, hyperparams={"it": [0, 1, 2, 3, 4, 5, 6, 7]})(x, y)
-    jax.jit(tune(_fn, hyperparams={"it": [0, 1, 2, 3, 4, 5, 6, 7]}))(x, y)
-  finally:
-    tuning.CONFIG.allow_fallback_timing = True
+      _fn = lambda x, y, it: _long_while(it, x, y)
+      tune(_fn, hyperparams={"it": [0, 1, 2, 3, 4, 5, 6, 7]})(x, y)
+      jax.jit(tune(_fn, hyperparams={"it": [0, 1, 2, 3, 4, 5, 6, 7]}))(x, y)
+    finally:
+      tuning.CONFIG.allow_fallback_timing = True
 
 
 if __name__ == "__main__":
-  test_parsing_multiple_profiles_on_gpu()
+  absltest.main()

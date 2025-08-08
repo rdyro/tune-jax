@@ -1,22 +1,24 @@
-import sys
 import tempfile
+from typing import Any
 from pathlib import Path
 from pprint import pprint
 
+XSpace = Any
+
 try:
-  from tune_jax.profile_reader import xplane_pb2
+  from jax.profiler import ProfileData
 except ImportError:
-  here_path = str(Path(__file__).parent.absolute())
-  if here_path not in sys.path:
-    sys.path.append(here_path)
+  ProfileData = None
 
-  import xplane_pb2
+if ProfileData is None:
+  try:
+    from tune_jax.profile_reader import xplane_pb2
+  except Exception as e:
+    raise ValueError("Importing the profiler proto failed. Do you have the latest protobuf?") from e
+else:
+  xplane_pb2 = None
 
-__all__ = [
-  "parse_profile_from_bytes",
-  "find_device_plane_ids",
-  "get_events_from_plane",
-]
+__all__ = ["parse_profile_from_bytes", "find_device_plane_ids", "get_events_from_plane"]
 
 
 def _get_stat_value(stat, metadata):
@@ -31,38 +33,54 @@ def _get_stat_value(stat, metadata):
 
 
 def _parse_stats(stats, stat_metadata):
-  return {stat_metadata[stat.metadata_id].name: _get_stat_value(stat, stat_metadata) for stat in stats}
+  if stat_metadata is not None:
+    return {stat_metadata[stat.metadata_id].name: _get_stat_value(stat, stat_metadata) for stat in stats}
+  return dict(stats)
 
 
 def _parse_event(event, event_metadata, stat_metadata):
-  name = event_metadata[event.metadata_id].name
+  if event_metadata is not None:
+    name = event_metadata[event.metadata_id].name
+  else:
+    name = event.name
   stats = _parse_stats(event.stats, stat_metadata)
   name = stats.get("hlo_module", name)  # hlo_module is GPU, name is TPU
   program_id = stats.get("program_id", stats.get("run_id"))  # program_id is GPU, run_id is TPU
   key = f"{name}({program_id})"
-  stats["start_ps"] = event.offset_ps
-  stats["end_ps"] = event.offset_ps + event.duration_ps
-  stats["duration_ps"] = event.duration_ps
+  if hasattr(event, "duration_ps"):
+    stats["start_ps"] = event.offset_ps
+    stats["end_ps"] = event.offset_ps + event.duration_ps
+    stats["duration_ps"] = event.duration_ps
+  else:
+    stats["start_ps"] = event.start_ns * 1e3
+    stats["end_ps"] = (event.start_ns + event.duration_ns) * 1e3
+    stats["duration_ps"] = event.duration_ns * 1e3
   return dict(jax_fn_name=key, fusion=name, **stats)
 
 
-def parse_profile_from_bytes(profile_bytes: bytes) -> xplane_pb2.XSpace:
+def parse_profile_from_bytes(profile_bytes: bytes) -> ProfileData:
+  if ProfileData is not None:
+    return ProfileData.from_serialized_xspace(profile_bytes)
   p = xplane_pb2.XSpace()
   p.ParseFromString(profile_bytes)
   return p
 
 
-def find_device_plane_ids(p: xplane_pb2.XSpace, device_str: str) -> list[int]:
+def find_device_plane_ids(p: XSpace, device_str: str) -> list[int]:
   return [i for i, plane in enumerate(p.planes) if device_str.lower() in plane.name.lower()]
 
 
 def get_events_from_plane(p, plane_idx, verbose: bool = False, just_id: bool = True) -> dict[str, list[float]]:
   """Returns a dict of xla module names (for unique inputs) to a list of their execution time in seconds."""
 
+  planes = list(p.planes)
   timed_events = {}
-  event_metadata, stat_metadata = p.planes[plane_idx].event_metadata, p.planes[plane_idx].stat_metadata
+  if hasattr(planes[plane_idx], "event_metadata"):
+    event_metadata, stat_metadata = planes[plane_idx].event_metadata, planes[plane_idx].stat_metadata
+  else:
+    event_metadata, stat_metadata = None, None
   all_parsed_events = []
-  for line in p.planes[plane_idx].lines:
+  for line in planes[plane_idx].lines:
     parsed_events = [_parse_event(event, event_metadata, stat_metadata) for event in line.events]
     all_parsed_events.extend(parsed_events)
 

@@ -33,6 +33,7 @@ from jax import numpy as jnp
 from jax import random
 from jax.experimental.pallas.ops.gpu import attention
 
+import tune_jax
 from tune_jax import tune, tune_logger
 
 tune_logger.setLevel("INFO")
@@ -66,6 +67,35 @@ tuned_mha_jit(q, k, v, segment_ids=None).block_until_ready()
 tuned_mha_jit(q, k, v, segment_ids=None).block_until_ready()
 
 print(tuned_mha_jit.timing_results)  # to get access to latest timing results
+
+print(tune_jax.tabulate(tuned_mha_jit.timing_results))  # to print nicely
+# print(tune_jax.tabulate(tuned_mha_jit))  # to rely on attribute extraction
+```
+
+```
+  id    block_q    block_k    t_mean (s)    t_std (s)
+----  ---------  ---------  ------------  -----------
+  23         32        128    5.2874e-05   1.1751e-06
+  35        128        128    5.4357e-05   2.1156e-07
+  29         64        128    5.6255e-05   3.1701e-06
+  17         16        128    5.8837e-05   6.744e-07
+  16         16         64    7.728e-05    1.161e-06
+  11          8        128    7.8282e-05   4.256e-07
+  27         64         32    8.4714e-05   3.7561e-07
+  21         32         32    8.5045e-05   1.4363e-07
+  33        128         32    8.5578e-05   9.8937e-07
+  15         16         32    0.00010546   1.5085e-08
+  10          8         64    0.00011382   7.1118e-07
+  26         64         16    0.00013777   1.3057e-06
+   5          4        128    0.00013904   2.6428e-07
+  20         32         16    0.0001392    4.1055e-07
+  32        128         16    0.00014012   2.7692e-07
+   9          8         32    0.000158     2.8738e-07
+  14         16         16    0.000195     3.935e-07
+   4          4         64    0.00021071   7.7064e-07
+   3          4         32    0.00025267   9.3753e-08
+   8          8         16    0.00026097   9.1332e-08
+   2          4         16    0.00042573   7.2384e-07
 ```
 
 ## API

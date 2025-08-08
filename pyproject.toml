@@ -1,8 +1,8 @@
 [project]
 name = "tune_jax"
-version = "0.4.0"
+version = "0.4.2"
 authors = [{ name = "Robert Dyro" }]
-dependencies = ["jax", "numpy", "tqdm", "protobuf"]
+dependencies = ["jax", "numpy", "tqdm", "protobuf", "absl-py", "tabulate"]
 description = "Microbenchmarking hyperparameter tuning for JAX functions."
 readme = "README.md"
 license = { file = "LICENSE" }

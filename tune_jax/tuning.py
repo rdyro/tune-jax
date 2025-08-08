@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import sys
 import traceback
-import functools
 import itertools
 import dataclasses
 import threading
 import tempfile
 import time
 import re
+from functools import partial, wraps
 from typing import Callable, Any
 from concurrent.futures import ThreadPoolExecutor, Future
 import logging
@@ -23,7 +23,6 @@ from jax import numpy as jnp
 from jax import random
 from jax.interpreters import pxla
 from jax.sharding import PartitionSpec, Sharding, SingleDeviceSharding
-from jax.experimental.pallas.ops.gpu import attention
 import numpy as np
 from tqdm import tqdm
 
@@ -43,6 +42,7 @@ TUNE_FN_PREFIX_FMT = "tune_jax_fn_{}"
 @dataclasses.dataclass
 class _Config:
   allow_fallback_timing: bool = True
+  must_find_at_least_profiler_result_fraction: float = 0.5
 
 
 CONFIG = _Config()
@@ -135,7 +135,7 @@ def _make_fn_to_time(
 ) -> Callable[..., Any]:
   """Embed hyperparameters into a function to time."""
 
-  jit_wrapper = functools.partial(jax.jit, out_shardings=out_shardings if out_shardings is not UNSPECIFIED else None)
+  jit_wrapper = partial(jax.jit, out_shardings=out_shardings if out_shardings is not UNSPECIFIED else None)
 
   def _fn(*args, **kws):
     return fn_to_tune(*args, **dict(kws, **hyperparams))
@@ -164,31 +164,30 @@ def _normalize_sharding(
 
 
 def _experimental_time_with_profiler(
-  _timing_closure: Callable[[], None], platform: str, total_calls_number: int
+  _timing_closure: Callable[[int], None], platform: str, total_calls_number: int
 ) -> dict[int, tuple[float, float]]:
   function_timings = {}
   for it in tqdm(range(total_calls_number), desc=f"Profiling {platform}"):
-    with tempfile.TemporaryDirectory(prefix="tuning_profile_", delete=False) as tempdir:
-      profile_path = Path(tempdir).absolute()
-      if it == 0:
-        logger.info("Saving optimization profile to `%s`", profile_path)
-      profile_path.mkdir(exist_ok=True)
-      with jax.profiler.trace(str(profile_path)):
-        _timing_closure(1)
-      profile_files = sorted(profile_path.glob("**/*.xplane.pb"), key=lambda f: f.stat().st_mtime)
-      if len(profile_files) == 0:
-        raise RuntimeError("No profile was created.")
-      latest_profile = profile_files[-1]
-      profile_proto = profile_reader.parse_profile_from_bytes(latest_profile.read_bytes())
-      device_plane_id = profile_reader.find_device_plane_ids(profile_proto, platform)[0]
-      profile_events = profile_reader.get_events_from_plane(profile_proto, device_plane_id, verbose=False)
-      fn_format = f"jit_{TUNE_FN_PREFIX_FMT.format('([0-9]+)')}.*"
-      for k, durations in profile_events.items():
-        if not re.match(fn_format, k):
-          continue
-        key = int(re.match(fn_format, k).group(1))
-        assert len(durations) == 1, "We are expecting a single call per profile"
-        function_timings.setdefault(key, []).extend(durations)
+    profile_path = Path(tempfile.mkdtemp(prefix="tuning_profile_")).absolute()
+    if it == 0:
+      logger.info("Saving optimization profile to `%s`", profile_path)
+    profile_path.mkdir(exist_ok=True)
+    with jax.profiler.trace(str(profile_path)):
+      _timing_closure(1)
+    profile_files = sorted(profile_path.glob("**/*.xplane.pb"), key=lambda f: f.stat().st_mtime)
+    if len(profile_files) == 0:
+      raise RuntimeError("No profile was created.")
+    latest_profile = profile_files[-1]
+    profile_proto = profile_reader.parse_profile_from_bytes(latest_profile.read_bytes())
+    device_plane_id = profile_reader.find_device_plane_ids(profile_proto, platform)[0]
+    profile_events = profile_reader.get_events_from_plane(profile_proto, device_plane_id, verbose=False)
+    fn_format = f"jit_{TUNE_FN_PREFIX_FMT.format('([0-9]+)')}.*"
+    for k, durations in profile_events.items():
+      if not re.match(fn_format, k):
+        continue
+      key = int(re.match(fn_format, k)[1])
+      assert len(durations) == 1, "We are expecting a single call per profile"
+      function_timings.setdefault(key, []).extend(durations)
 
   for key, durations in function_timings.items():
     if len(durations) > 2:
@@ -198,8 +197,8 @@ def _experimental_time_with_profiler(
   return function_timings
 
 
-@functools.partial(jax.jit, static_argnames=("sds", "sharding"))
-def _get_random_value(sds, sharding):
+@partial(jax.jit, static_argnames=("sds", "sharding"))
+def _get_random_value(sds, sharding=None):
   """Random values based on the tracer shape and dtype, and the sharding."""
 
   if hasattr(sds, "shape") and hasattr(sds, "dtype"):
@@ -227,9 +226,44 @@ def _try_hash_input(args, kws):
     return None
 
 
+def _tabulate_results(timing_results: dict[int, TimingResult] | Callable):
+  if callable(timing_results):
+    if not hasattr(timing_results, "timing_results"):
+      raise ValueError("A function passed to `timing_results_to_df`, but it's missing a `timing_results` attribute.")
+    timing_results: dict[int, TimingResult] = timing_results.timing_results
+  if not isinstance(timing_results, dict):
+    raise ValueError(f"Timing results passed to tabulate is not a dict, it's `{type(timing_results)}` instead.")
+  if len(timing_results) == 0:
+    return [], ["id", "t_mean (s)", "t_std (s)"]
+  hyperparams_keys = list(timing_results.values())[0].hyperparams.keys()
+  values = [
+    [id] + [r.hyperparams[k] for k in hyperparams_keys] + [f"{r.t_mean:.4e}", f"{r.t_std:.4e}"]
+    for id, r in timing_results.items()
+  ]
+  columns = ["id"] + list(hyperparams_keys) + ["t_mean (s)", "t_std (s)"]
+  return columns, values
+
+
+def tabulate(timing_results: dict[int, TimingResult] | Callable) -> str:
+  """Tabulate the timining results sorted fastest first with the `tabulate` package."""
+  import tabulate
+
+  columns, data = _tabulate_results(timing_results)
+  return tabulate.tabulate(data, headers=columns)
+
+
+def to_df(timing_results: dict[int, TimingResult] | Callable):
+  """Tabulate the timining results sorted fastest first with the `pandas` package."""
+  import pandas as pd
+
+  columns, data = _tabulate_results(timing_results)
+  index, data = [row[0] for row in data], [row[1:] for row in data]
+  return pd.DataFrame(data, index=index, columns=columns[1:])
+
+
 def tune(
   fn_to_tune: Callable[..., Any],
-  hyperparams: dict[Any, Any],
+  hyperparams: dict[Any, Any] | None = None,
   max_workers: int = 32,
   in_shardings: Any = UNSPECIFIED,
   out_shardings: Any = UNSPECIFIED,
@@ -252,10 +286,13 @@ def tune(
       store_results (bool): Attach the timining results to the function handle (i.e., fn.timing_results)?
   """
 
+  hyperparams = hyperparams if hyperparams is not None else dict()
+
   def _get_best_hyperparams(args, kws):
     """Main tuning method."""
 
     # resolve sharding and/or device placement #################################
+    _maybe_aval = lambda x: x if not isinstance(x, jax.Array) else jax.typeof(x)
     if len(args) == 0 or all(x is None or jax.core.is_concrete(x) for x in jax.tree.leaves(args)):
       logger.info("All arguments are concrete, no need to pick random values.")
       args_val = args
@@ -274,11 +311,8 @@ def tune(
       shardings = in_shardings if in_shardings is not UNSPECIFIED else jax.tree.map(lambda _: None, args)
       shardings = (shardings,) if len(args) == 1 else shardings
       shardings = jax.tree.map(
-        functools.partial(_normalize_sharding, default_device=resolved_device),
-        tuple(args),
-        tuple(shardings),
+        partial(_normalize_sharding, default_device=resolved_device), tuple(args), tuple(shardings)
       )
-      _maybe_aval = lambda x: x if not isinstance(x, jax.Array) else x.aval
       args_val = jax.tree.map(lambda x, s: _get_random_value(_maybe_aval(x), s), args, shardings)
 
     if len(kws) == 0 or all(v is None or jax.core.is_concrete(v) for v in kws.values()):
@@ -296,13 +330,15 @@ def tune(
 
     fns = dict()
     hyperparam_settings = dict(enumerate(itertools.product(*hyperparams_norm.values())))
+    if len(hyperparam_settings) == 0:
+      hyperparam_settings[0] = []  # allow no hyperparamters to tune, just time the function
 
     with _global_tuning_lock:
       # filter hyperparameters for those that compile ##########################
       for _ in range(2):  # sometimes a kernel compiles once, but not twice
         compiles: dict[int, Future[CompileResult]] = dict()
-        for i, kws in hyperparam_settings.items():
-          hs = dict(zip(hyperparams_norm.keys(), kws))
+        for i, vals in hyperparam_settings.items():
+          hs = dict(zip(hyperparams_norm.keys(), vals))
           fns[i] = _make_fn_to_time(fn_to_tune, hs, out_shardings=out_shardings, name_id=i)
           compiles[i] = executor.submit(lambda fn: _try_call(lambda: fn(*args_val, **kws_val)), fns[i])
         future_pbar = tqdm(
@@ -333,19 +369,32 @@ def tune(
     try:
       repeats = 5
 
-      def _timing_closure(repeats: int):
+      def _timing_closure(repeats: int) -> None:
         hs = list(hyperparam_settings.items())
         pyrandom.shuffle(hs)
-        for i, hs in hs:
-          hs = dict(zip(hyperparams_norm.keys(), hs))
-          _time_fn(lambda: fns[i](*args_val, **kws_val), repeat=repeats, number=1)
+        for i, _ in hs:
+          _time_fn(partial(lambda fn: fn(*args_val, **kws_val), fns[i]), repeat=repeats, number=1)
 
-      if len(jax.tree.leaves(args_val)) > 0:
-        platform = list(jax.tree.leaves(args_val)[0].devices())[0].platform
+      args_with_device = [list(args.devices())[0] for args in jax.tree.leaves(args_val) if hasattr(args, "devices")]
+      if len(args_with_device) > 0:
+        platform = args_with_device[0].platform
       else:
         platform = _get_default_device().platform
 
       profiler_timings = _experimental_time_with_profiler(_timing_closure, platform, total_calls_number=repeats)
+      if (
+        sum(1 for i in hyperparam_settings.keys() if i in profiler_timings) / len(hyperparam_settings)
+        < CONFIG.must_find_at_least_profiler_result_fraction
+      ):
+        msg = "Could not find profiler results for some hyperparameter settings:"
+        for i in [i for i in hyperparam_settings.keys() if i not in profiler_timings]:
+          msg += f"\n  - {i}: {hyperparam_settings[i]}"
+        raise RuntimeError(msg)
+      else:
+        for i in hyperparam_settings.keys():
+          if i not in profiler_timings:
+            logger.warning(f"Could not find profiler results for hyperparameter settings: {hyperparam_settings[i]}")
+            profiler_timings[i] = (float("nan"), float("nan"))
       for i, hs in hyperparam_settings.items():
         hs = dict(zip(hyperparams_norm.keys(), hs))
         results[i] = TimingResult(hs, *profiler_timings[i])
@@ -359,7 +408,7 @@ def tune(
       hs_pbar = tqdm(hyperparam_settings.items(), **_opts)
       for i, hs in hs_pbar:
         hs = dict(zip(hyperparams_norm.keys(), hs))
-        results[i] = TimingResult(hs, *_time_fn(lambda: fns[i](*args_val, **kws_val), repeat=10))
+        results[i] = TimingResult(hs, *_time_fn(partial(lambda fn: fn(*args_val, **kws_val), fns[i]), repeat=10))
 
     results = sorted(results.items(), key=lambda x: _timing_loss(x[1]))
     idx, optimal_hyperparams = results[0][0], results[0][1].hyperparams
@@ -367,7 +416,7 @@ def tune(
     logger.info(f"optimal hyperparams: {optimal_hyperparams}")
     return fns[idx], optimal_hyperparams, results
 
-  @functools.wraps(fn_to_tune)
+  @wraps(fn_to_tune)
   def wrapped_fn(*args, **kws):
     maybe_hash = _try_hash_input(args, kws)
     if maybe_hash is not None and maybe_hash in wrapped_fn.hyperparams_cache:
@@ -391,6 +440,8 @@ def tune(
 
 
 def test_main():
+  from jax.experimental.pallas.ops.gpu import attention
+
   hyperparams = {
     # anything below 16 will fail since the smallest matmul block is 16x16
     "block_q": [4, 8, 16, 32, 64, 128],
@@ -404,7 +455,7 @@ def test_main():
   k = random.normal(random.key(0), (b, kt, h, d), dtype=jnp.bfloat16)
   v = random.normal(random.key(0), (b, kt, h, d), dtype=jnp.bfloat16)
 
-  attention_wrapper = lambda *args, block_q=None, block_k=None, **kw: attention.mha(
+  attention_wrapper = lambda *args, block_q, block_k, **kw: attention.mha(
     *args,
     **dict(kw, block_sizes=attention.BlockSizes(block_q=block_q, block_k=block_k)),
   )
@@ -416,8 +467,8 @@ def test_main():
 
   if False:
 
-    @functools.partial(jax.jit, in_shardings=SingleDeviceSharding(jax.devices("cuda")[0]))
-    @functools.partial(tune, hyperparams=hyperparams, device=jax.devices("cuda")[0])
+    @partial(jax.jit, in_shardings=SingleDeviceSharding(jax.devices("cuda")[0]))
+    @partial(tune, hyperparams=hyperparams, device=jax.devices("cuda")[0])
     def forward_twice(q, k, v, **hyperparams):
       x1 = attention.mha(q, k, v, segment_ids=None, **hyperparams)
       x2 = attention.mha(q, k, v, segment_ids=None, **hyperparams)
