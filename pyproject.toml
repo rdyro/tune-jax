@@ -1,11 +1,14 @@
 [project]
 name = "tune_jax"
-version = "0.4.2"
+version = "0.5.0"
 authors = [{ name = "Robert Dyro" }]
-dependencies = ["jax", "numpy", "tqdm", "protobuf", "absl-py", "tabulate"]
+dependencies = ["jax", "numpy", "tqdm", "protobuf", "tabulate"]
 description = "Microbenchmarking hyperparameter tuning for JAX functions."
 readme = "README.md"
 license = { file = "LICENSE" }
+
+[project.optional-dependencies]
+test = ["absl-py", "pytest"]
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
@@ -26,26 +29,11 @@ target-version = "py310"
 [tool.ruff.lint]
 ignore = [
     "C408",  # Unnecessary collection call
-    "C417",  # Unnecessary map usage
-    "C420",  # Unnecessary dict comprehension for iterable
     "C901",  # Object names too complex
     "F841",  # Local variable is assigned to but never used
     "B904",  # Raise with from clause inside except block
-    "B905",  # Zip without explicit strict parameter
+    "E111",  # ignore indentation not being 4 (we use 2)
+    "E114",  # ignore indentation not being 4 in comments
+    "E731",  # allow local lambdas
 ]
-select = [
-    "B9",
-    "C",
-    "F",
-    "W",
-    "YTT",
-    "ASYNC",
-    "E101",
-    "E112",
-    "E113",
-    "E115",
-    "E117",
-    "E225",
-    "E227",
-    "E228",
-]
+select = ["B9", "C", "F", "W", "YTT", "ASYNC", "E"]

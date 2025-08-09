@@ -7,9 +7,9 @@ from jax.experimental.pallas.ops.gpu import attention
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 from absl.testing import absltest
 
-from tune_jax import tune, tune_logger
+import tune_jax
 
-tune_logger.setLevel("DEBUG")
+tune_jax.logger.setLevel("DEBUG")
 
 
 def platforms_available(*platforms):
@@ -17,9 +17,10 @@ def platforms_available(*platforms):
     try:
       jax.devices(platform)
       return True
-    except:
+    except:  # noqa: E722
       pass
   return False
+
 
 class SimpleCasesTest(absltest.TestCase):
   def test_matmul_size(self):
@@ -35,13 +36,12 @@ class SimpleCasesTest(absltest.TestCase):
       C = A @ B
       return C / jnp.linalg.norm(C, axis=-1)[..., None]
 
-    tuned_mha = tune(fn, hyperparams=hyperparams)
+    tuned_mha = tune_jax.tune(fn, hyperparams=hyperparams)
     tuned_mha_jit = jax.jit(tuned_mha)
 
     _ = tuned_mha_jit().block_until_ready()
     C = tuned_mha_jit().block_until_ready()
     assert C.shape[-1] == min(hyperparams["n"])
-
 
   def test_simple_mha(self):
     if not platforms_available("gpu"):
@@ -66,7 +66,7 @@ class SimpleCasesTest(absltest.TestCase):
       attention_fn = attention_wrapper
     else:  # jax < 0.5.2
       attention_fn = attention.mha
-    tuned_mha = tune(jax.jit(attention_fn, static_argnames=("block_q", "block_k")), hyperparams=hyperparams)
+    tuned_mha = tune_jax.tune(jax.jit(attention_fn, static_argnames=("block_q", "block_k")), hyperparams=hyperparams)
     tuned_mha_jit = jax.jit(tuned_mha)
 
     tuned_mha_jit(q, k, v, segment_ids=None).block_until_ready()
@@ -78,7 +78,6 @@ class SimpleCasesTest(absltest.TestCase):
     tuned_mha_jit(q, k, v, segment_ids=None).block_until_ready()
 
     print(tuned_mha_jit.timing_results)  # to get access to latest timing results
-
 
   def test_multidevice(self):
     if not platforms_available("gpu"):
@@ -108,11 +107,11 @@ class SimpleCasesTest(absltest.TestCase):
         *args,
         **dict(kw, block_sizes=attention.BlockSizes(block_q=block_q, block_k=block_k)),
       )
-      tuned_mha = tune(
+      tuned_mha = tune_jax.tune(
         functools.partial(attention_wrapper, segment_ids=None), hyperparams=hyperparams, in_shardings=in_shardings
       )
     else:  # jax < 0.5.2
-      tuned_mha = tune(
+      tuned_mha = tune_jax.tune(
         functools.partial(attention.mha, segment_ids=None), hyperparams=hyperparams, in_shardings=in_shardings
       )
     tuned_mha_jit = jax.jit(tuned_mha, in_shardings=in_shardings)  # type: ignore

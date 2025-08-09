@@ -128,8 +128,7 @@ def test_main():
   print([p.planes[i].name for i in gpu_plane_ids])
 
   events = get_events_from_plane(p, gpu_plane_ids[0])
-  _mean = lambda x: sum(x) / len(x)
-  pprint({k: _mean(v) for k, v in events.items()})
+  pprint({k: sum(v) / len(v) for k, v in events.items()})
 
 
 if __name__ == "__main__":
