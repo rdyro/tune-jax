@@ -10,6 +10,7 @@ import threading
 import tempfile
 import time
 import re
+import io
 from functools import partial, wraps
 from typing import Callable, Any
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -17,6 +18,8 @@ import logging
 from pprint import pformat
 from pathlib import Path
 import random as pyrandom
+import textwrap
+import inspect
 
 import jax
 import jax.core
@@ -274,22 +277,112 @@ def to_df(timing_results: dict[int, TimingResult] | Callable):
   return pd.DataFrame(data, index=index, columns=columns[1:])
 
 
-def record(fn: Callable):
+def codegen_a_tuning_script(fn: Callable, args: tuple, kws: dict, dir_or_buffer: str | io.IOBase):
+  qualname, module, fname, source_code = fn.__qualname__, fn.__module__, fn.__name__, inspect.getsource(fn)
+
+  class Literal:  # allows pformat to interpolate strings like my_name instead of "my_name"
+    def __init__(self, val: Any):
+      self.val = val
+
+    def __repr__(self) -> str:
+      return self.val
+
+  total_arrays = 0
+
+  def init_obj(x):
+    nonlocal total_arrays
+    _normal_init = "random.normal(next(keys), {shape}, dtype={dtype})"
+    _const_init = "jnp.full({shape}, {value}, dtype={dtype})"
+    if isinstance(x, jax.Array):
+      total_arrays += 1
+      try:
+        local_shape = x.sharding.shard_shape(x.shape)
+      except AttributeError:
+        local_shape = x.shape
+      if jnp.issubdtype(x.dtype, jnp.floating):
+        return Literal(_normal_init.format(shape=str(local_shape), dtype=x.dtype.name))
+      else:
+        return Literal(_const_init.format(shape=local_shape, value=1, dtype=x.dtype))
+    else:
+      return Literal(str(x))
+
+  args_init, kw_init = jax.tree.map(init_obj, args), jax.tree.map(init_obj, kws)
+  if "<locals>" not in qualname:
+    import_statement = f"from {module} import {fname}"
+  else:
+    import_statement = textwrap.dedent(source_code)
+    if "<lambda>" in qualname:  # strip all before the first "lambda" in the source code and give it a name
+      fname = "my_lambda"
+      import_statement = f"{fname} = {import_statement[max(import_statement.find('lambda'), 0) :].lstrip()}"
+  code = f"""
+import jax
+import jax.numpy as jnp
+from jax import random
+
+import tune_jax
+
+# your function #########################################
+# (some imports might be missing)
+{import_statement.strip()}
+
+# hyperparameters #######################################
+hyperparams = {{
+    # FILL ME IN
+}}
+
+# random inputs #########################################
+# (hyperparameters have been wrongly placed in the args/kws)
+keys = iter(random.split(random.key(0), {total_arrays}))
+args = {textwrap.indent(pformat(args_init, width=120), " " * 7).strip()}
+kws = {textwrap.indent(pformat(kw_init, width=120), " " * 6).strip()}
+
+# tuning ################################################
+fn = tune_jax.tune({fname}, hyperparams=hyperparams)
+fn(*args, **kws)
+print(tune_jax.tabulate(fn))
+"""
+  if isinstance(dir_or_buffer, io.IOBase) or hasattr(dir_or_buffer, "write"):
+    dir_or_buffer.write(code.encode())
+  else:
+    path = Path(dir_or_buffer).expanduser().absolute()
+    path.mkdir(exist_ok=True, parents=True)
+    assert path.exists()
+    tuning_filename = str(time.time_ns())
+    tuning_path = path / (f"{re.sub(r'(<|>)', '_', qualname)}_{tuning_filename}.py")
+    tuning_path.write_text(code)
+
+
+def record(fn: Callable, codegen_dir_or_buffer: str | io.IOBase | None = None):
+  """Record a function call (under jit is ok) to remember its input arguments shapes for tuning.
+
+  Example:
+    ```
+    @tune_jax.record
+    def my_library_function(...):
+        ...
+    ```
+
+  Optionally codegen a simple tuning template script.
+  """
   seen_hashes = {}
 
+  @wraps(fn)
   def _recorded_fn(*args, **kws):
     nonlocal seen_hashes
     input_hash = _try_hash_input(args, kws, must_be_concrete=False)
     if input_hash is not None and input_hash not in seen_hashes:
-      recorded_args = jax.tree.map(lambda x: x if not isinstance(x, jax.Array) else jax.typeof(x), args)
-      recorded_kw = jax.tree.map(lambda x: x if not isinstance(x, jax.Array) else jax.typeof(x), kws)
-      args_str = ", ".join(map(pformat, recorded_args))
-      kw_str = ", ".join([f"{k}={pformat(v)}" for k, v in recorded_kw.items()])
-      logger.info(
-        f"Called {fn.__code__.co_filename}:{fn.__code__.co_firstlineno}\n{fn.__module__}.{fn.__name__}("
-        f"{', '.join([args_str, kw_str])})"
-      )
       seen_hashes[input_hash] = True
+      fn_: Callable = fn
+      while hasattr(fn_, "_fun"):  # unpack PjitFunctions, it's jitted
+        fn_ = getattr(fn_, "_fun")
+      module, fname, code = fn_.__module__, fn_.__name__, fn_.__code__
+      recorded_args = jax.tree.map(lambda x: x if not isinstance(x, jax.Array) else jax.typeof(x), args)
+      recorded_kws = jax.tree.map(lambda x: x if not isinstance(x, jax.Array) else jax.typeof(x), kws)
+      args_str = ", ".join(map(pformat, recorded_args))
+      kw_str = ", ".join([f"{k}={pformat(v)}" for k, v in recorded_kws.items()])
+      logger.info(f"Called {code.co_filename}:{code.co_firstlineno}\n{module}.{fname}({', '.join([args_str, kw_str])})")
+      if codegen_dir_or_buffer is not None:
+        codegen_a_tuning_script(fn_, args, kws, codegen_dir_or_buffer)
     return fn(*args, **kws)
 
   return _recorded_fn
@@ -317,7 +410,7 @@ def tune(
       device (jax.Device | _UnspecifiedT, optional): device to tune on if shardings are unspecified.
       example_args (tuple[Any] | None, optional): Exact example_args to tune with, on correct device.
       example_kws (dict[Any, Any] | None, optional): Exact example_kws to tune with, on correct device.
-      sample_num (int | float): Number of samples use for tuning. Defaults to full cartesian product (all samples).
+      sample_num (int | float): Number of samples used for tuning. Defaults to full cartesian product (all samples).
   """
 
   hyperparams_ = hyperparams if hyperparams is not None else dict()
@@ -475,7 +568,7 @@ def test_main():
   hyperparams = {
     "block_q": [4, 8, 16, 32, 64, 128],
     "block_k": [4, 8, 16, 32, 64, 128],
-    "segment_ids": None,
+    "segment_ids": None,  # scalars are ok
   }
 
   b, qt, h, d = 8, 32, 8, 512
@@ -491,7 +584,7 @@ def test_main():
   )
 
   tuned_mha = tune(attention_wrapper, hyperparams=hyperparams, sample_num=5)
-  tuned_mha_jit = jax.jit(tuned_mha)
+  tuned_mha_jit = record(jax.jit(tuned_mha), codegen_tuning_script_dir="/tmp/tuning_mha")
 
   logger.setLevel("DEBUG")
 
