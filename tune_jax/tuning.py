@@ -291,8 +291,8 @@ def codegen_a_tuning_script(fn: Callable, args: tuple, kws: dict, dir_or_buffer:
 
   def init_obj(x):
     nonlocal total_arrays
-    _normal_init = "random.normal(next(keys), {shape}, dtype={dtype})"
-    _const_init = "jnp.full({shape}, {value}, dtype={dtype})"
+    _normal_init = "random.normal(next(keys), {shape}, dtype='{dtype}')"
+    _const_init = "jnp.full({shape}, {value}, dtype='{dtype}')"
     if isinstance(x, jax.Array):
       total_arrays += 1
       try:
@@ -315,9 +315,12 @@ def codegen_a_tuning_script(fn: Callable, args: tuple, kws: dict, dir_or_buffer:
       fname = "my_lambda"
       import_statement = f"{fname} = {import_statement[max(import_statement.find('lambda'), 0) :].lstrip()}"
   code = f"""
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 from jax import random
+from jax.experimental.layout import Format, Layout
 
 import tune_jax
 
@@ -335,6 +338,23 @@ hyperparams = {{
 keys = iter(random.split(random.key(0), {total_arrays}))
 args = {textwrap.indent(pformat(args_init, width=120), " " * 7).strip()}
 kws = {textwrap.indent(pformat(kw_init, width=120), " " * 6).strip()}
+
+# optimal layouts microbenchmarking #####################
+xs_flat, xs_struct = jax.tree.flatten((args, kws))
+xs_arr = [x if isinstance(x, jax.Array) else None for x in xs_flat]
+xs_obj = [x if not isinstance(x, jax.Array) else None for x in xs_flat]
+
+def fn_flat(*xs_arr_flat):
+  xs_flat = [x if x is not None else y for x, y in zip(xs_arr_flat, xs_obj)]
+  args_, kws_ = jax.tree.unflatten(xs_struct, xs_flat)
+  fn_with_hyperparams = partial({fname}, )  # FILL ME IN: hyperparams that will definitely compile
+  return fn_with_hyperparams(*args_, **kws_)
+
+shapes = [jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding) if x is not None else None for x in xs_arr]
+formats_flat = jax.jit(fn_flat, in_shardings=Format(Layout.AUTO)).lower(*xs_arr).compile().input_formats[0]
+formats = jax.tree.unflatten(xs_struct, formats_flat)
+
+(args, kws) = jax.tree.map(lambda x, l: jax.device_put(x, l) if l is not None else x, (args, kws), formats)
 
 # tuning ################################################
 fn = tune_jax.tune({fname}, hyperparams=hyperparams)
@@ -518,7 +538,7 @@ def tune(
         for i in hyperparam_settings.keys():
           if i not in profiler_timings:
             logger.warning(f"Could not find profiler results for hyperparameter settings: {hyperparam_settings[i]}")
-            profiler_timings[i] = (float("nan"), float("nan"))
+            profiler_timings[i] = (float("inf"), float("inf"))  # nan doesn't work here since it sorts improperly
       for i, hs in hyperparam_settings.items():
         hs = dict(zip(hyperparams_norm.keys(), hs, strict=True))
         results[i] = TimingResult(hs, *profiler_timings[i])
