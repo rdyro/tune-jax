@@ -117,7 +117,6 @@ def _try_call(fn: Callable[[], None], args_val, kws_val, compile_only: bool = Fa
 
 def _time_fn(fn: Callable[[], None], repeat: int = 5, number: int = 3) -> tuple[float, float]:
   """Time a function in a global single-threaded lock, so system is unloaded."""
-  # assert repeat >= 2, f"{repeat = } must be >= 2, we discard slowest result."
   with _global_tuning_lock:
     _blocked_call = lambda: jax.block_until_ready(fn())
     times_raw = []
@@ -277,7 +276,7 @@ def to_df(timing_results: dict[int, TimingResult] | Callable):
   return pd.DataFrame(data, index=index, columns=columns[1:])
 
 
-def codegen_a_tuning_script(fn: Callable, args: tuple, kws: dict, dir_or_buffer: str | io.IOBase):
+def codegen_a_tuning_script(fn: Callable, args: tuple, kws: dict, dir_or_buffer: str | io.IOBase | None):
   qualname, module, fname, source_code = fn.__qualname__, fn.__module__, fn.__name__, inspect.getsource(fn)
 
   class Literal:  # allows pformat to interpolate strings like my_name instead of "my_name"
@@ -361,8 +360,14 @@ fn = tune_jax.tune({fname}, hyperparams=hyperparams)
 fn(*args, **kws)
 print(tune_jax.tabulate(fn))
 """
-  if isinstance(dir_or_buffer, io.IOBase) or hasattr(dir_or_buffer, "write"):
+  if dir_or_buffer is None:
+    logger.info("Auto-tuning script " + "-" * 61 + "\n" + code + "\n" + "-" * 80)
+  elif isinstance(dir_or_buffer, io.TextIOBase):
+    dir_or_buffer.write(code)
+  elif isinstance(dir_or_buffer, io.IOBase):
     dir_or_buffer.write(code.encode())
+  elif hasattr(dir_or_buffer, "write"):
+    dir_or_buffer.write(code)
   else:
     path = Path(dir_or_buffer).expanduser().absolute()
     path.mkdir(exist_ok=True, parents=True)
@@ -372,7 +377,7 @@ print(tune_jax.tabulate(fn))
     tuning_path.write_text(code)
 
 
-def record(fn: Callable, codegen_dir_or_buffer: str | io.IOBase | None = None):
+def record(fn: Callable, dir_or_buffer: str | io.IOBase | None = None):
   """Record a function call (under jit is ok) to remember its input arguments shapes for tuning.
 
   Example:
@@ -401,8 +406,7 @@ def record(fn: Callable, codegen_dir_or_buffer: str | io.IOBase | None = None):
       args_str = ", ".join(map(pformat, recorded_args))
       kw_str = ", ".join([f"{k}={pformat(v)}" for k, v in recorded_kws.items()])
       logger.info(f"Called {code.co_filename}:{code.co_firstlineno}\n{module}.{fname}({', '.join([args_str, kw_str])})")
-      if codegen_dir_or_buffer is not None:
-        codegen_a_tuning_script(fn_, args, kws, codegen_dir_or_buffer)
+      codegen_a_tuning_script(fn_, args, kws, dir_or_buffer)
     return fn(*args, **kws)
 
   return _recorded_fn
