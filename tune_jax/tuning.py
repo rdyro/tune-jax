@@ -529,7 +529,7 @@ def tune(
         hs = list(hyperparam_settings.items())
         pyrandom.shuffle(hs)
         for i, _ in hs:
-          _time_fn(partial(lambda fn: fn(*args_val, **kws_val), fns[i]), repeat=CONFIG.profiling_samples, number=1)
+          _time_fn(partial(lambda fn: fn(*args_val, **kws_val), fns[i]), repeat=1, number=1)
 
       profiler_timings = _experimental_time_with_profiler(_timing_closure, platform, CONFIG.profiling_samples)
       fraction_measured = sum(1 for i in hyperparam_settings.keys() if i in profiler_timings) / len(hyperparam_settings)
