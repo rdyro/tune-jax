@@ -89,8 +89,8 @@ def _get_global_mesh():
 
 
 def _get_default_device():
-  if jax.default_device.value is not None:
-    return jax.default_device.value
+  if jax.config.values["jax_default_device"] is not None:
+    return jax.config.values["jax_default_device"]
   return jax.devices()[0]
 
 
@@ -191,7 +191,7 @@ def _experimental_time_with_profiler(
     latest_profile = profile_files[-1]
     profile_proto = profile_reader.parse_profile_from_bytes(latest_profile.read_bytes())
     device_plane_id = profile_reader.find_device_plane_ids(profile_proto, platform)[0]
-    profile_events = profile_reader.get_events_from_plane(profile_proto, device_plane_id, verbose=False)
+    profile_events = profile_reader.get_events_from_plane(profile_proto, device_plane_id, filter_prefix="jit_")
     fn_format = f"jit_{TUNE_FN_PREFIX_FMT.format('([0-9]+)')}.*"
     for k, durations in profile_events.items():
       if not re.match(fn_format, k):
@@ -457,6 +457,8 @@ def tune(
     else:
       logger.debug("Selecting random input arguments.")
       resolved_device = device if isinstance(device, jax.Device) else _get_default_device()
+      if isinstance(resolved_device, str):  # in case the default device is a string `with jax.default_device("cpu"):`
+        resolved_device = jax.devices(resolved_device)[0]
       shardings = in_shardings if in_shardings is not UNSPECIFIED else jax.tree.map(lambda _: None, args)
       shardings = (shardings,) if len(args) == 1 else shardings
       shardings = jax.tree.map(

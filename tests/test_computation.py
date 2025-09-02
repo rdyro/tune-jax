@@ -79,6 +79,15 @@ class SimpleCasesTest(absltest.TestCase):
 
     print(tuned_mha_jit.timing_results)  # to get access to latest timing results
 
+  def test_default_device_resolution(self):
+    out = jax.jit(tune_jax.tune(lambda x: x))(1)
+    with jax.default_device("cpu"):  # test that the default device resolves with a string spec "cpu"
+      out = jax.jit(tune_jax.tune(lambda x: x))(1)
+      self.assertEqual(list(out.devices())[0].platform.lower(), "cpu")
+    with jax.default_device(jax.devices("cpu")[0]):  # test that the default device resolves with a full spec
+      out = jax.jit(tune_jax.tune(lambda x: x))(1)
+      self.assertEqual(list(out.devices())[0].platform.lower(), "cpu")
+
   def test_multidevice(self):
     if not platforms_available("gpu"):
       self.skipTest("No GPU available")

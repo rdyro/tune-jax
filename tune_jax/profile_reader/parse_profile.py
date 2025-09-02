@@ -38,13 +38,15 @@ def _parse_stats(stats, stat_metadata):
   return dict(stats)
 
 
-def _parse_event(event, event_metadata, stat_metadata):
+def _parse_event(event, event_metadata, stat_metadata, prefix_filter: str = ""):
   if event_metadata is not None:
     name = event_metadata[event.metadata_id].name
   else:
     name = event.name
   stats = _parse_stats(event.stats, stat_metadata)
   name = stats.get("hlo_module", name)  # hlo_module is GPU, name is TPU
+  if not name.startswith(prefix_filter):
+    return None
   program_id = stats.get("program_id", stats.get("run_id"))  # program_id is GPU, run_id is TPU
   key = f"{name}({program_id})"
   if hasattr(event, "duration_ps"):
@@ -70,7 +72,7 @@ def find_device_plane_ids(p: XSpace, device_str: str) -> list[int]:
   return [i for i, plane in enumerate(p.planes) if device_str.lower() in plane.name.lower()]
 
 
-def get_events_from_plane(p, plane_idx, verbose: bool = False, just_id: bool = True) -> dict[str, list[float]]:
+def get_events_from_plane(p, plane_idx, verbose: bool = False, filter_prefix: str = "") -> dict[str, list[float]]:
   """Returns a dict of xla module names (for unique inputs) to a list of their execution time in seconds."""
 
   planes = list(p.planes)
@@ -81,21 +83,20 @@ def get_events_from_plane(p, plane_idx, verbose: bool = False, just_id: bool = T
     event_metadata, stat_metadata = None, None
   all_parsed_events = []
   for line in planes[plane_idx].lines:
-    parsed_events = [_parse_event(event, event_metadata, stat_metadata) for event in line.events]
+    parsed_events = [_parse_event(event, event_metadata, stat_metadata, filter_prefix) for event in line.events]
+    parsed_events = [event for event in parsed_events if event is not None]
     all_parsed_events.extend(parsed_events)
 
     xla_modules = {}
     for event in parsed_events:
-      key = (event["jax_fn_name"], event["scope_range_id"]) if not just_id else (event["jax_fn_name"],)
-      xla_modules.setdefault(key, []).append(event)
+      xla_modules.setdefault(event["jax_fn_name"], []).append(event)
     xla_modules = {
       k: (max([e["end_ps"] for e in event_list], default=0) - min([e["start_ps"] for e in event_list], default=0))
       / 1e12
       for k, event_list in xla_modules.items()
     }
     grouped_timings = {}
-    for key, duration in xla_modules.items():
-      xla_module_name = key[0]
+    for xla_module_name, duration in xla_modules.items():
       grouped_timings.setdefault(xla_module_name, []).append(duration)
     timed_events |= grouped_timings
 
