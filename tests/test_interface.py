@@ -49,6 +49,24 @@ class InterfaceTest(parameterized.TestCase):
     print(tune_jax.tabulate(fn_tuned.timing_results))
     print(tune_jax.tabulate(fn_tuned))  # this should automatically look for timing_results attribute
 
+  @parameterized.parameters([True, False])
+  def test_optimal_hyperparams_field(self, jit: bool):
+    def fn(x, a, b):
+      return x
+
+    fn = jax.jit(fn) if jit else fn
+
+    fn_tuned = tune_jax.tune(fn, hyperparams={"a": list(range(10)), "b": 2})
+    fn_tuned = jax.jit(fn_tuned) if jit else fn_tuned
+    fn_tuned(1)
+
+    self.assertTrue(hasattr(fn_tuned, "timing_results"))
+    self.assertTrue(hasattr(fn_tuned, "optimal_hyperparams"))
+    optimal_hyperparams = sorted(
+        fn_tuned.timing_results.items(), key=lambda x: tune_jax.tuning._timing_loss(x[1])
+    )[0][1].hyperparams
+    self.assertEqual(tuple(optimal_hyperparams.items()), tuple(fn_tuned.optimal_hyperparams.items()))
+
   def test_tabulate_results(self):
     def fn(x, a, b):
       return x

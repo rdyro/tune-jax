@@ -578,10 +578,13 @@ def tune(
         wrapped_fn.hyperparams_cache[maybe_hash] = (optimal_hyperparameters, results)
     wrapped_fn.timing_results.clear()
     wrapped_fn.timing_results.update(results)
+    wrapped_fn.optimal_hyperparams.clear()
+    wrapped_fn.optimal_hyperparams.update(optimal_hyperparameters)
     return fn_to_tune(*args, **dict(kws, **optimal_hyperparameters))
 
   wrapped_fn.timing_results = {}
   wrapped_fn.hyperparams_cache = {}
+  wrapped_fn.optimal_hyperparams = {}
   return wrapped_fn
 
 
