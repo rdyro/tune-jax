@@ -2,7 +2,6 @@ from functools import partial
 
 from absl.testing import absltest
 import jax
-import jax.core
 import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P, AbstractMesh
 
