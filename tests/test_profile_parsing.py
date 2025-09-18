@@ -1,3 +1,5 @@
+import os
+
 import jax
 from jax import numpy as jnp
 from jax import random
@@ -7,7 +9,7 @@ import tune_jax
 
 tune_jax.logger.setLevel("DEBUG")
 
-TEST_KERNELS = False
+TEST_WITH_PALLAS = os.environ.get("TEST_WITH_PALLAS", True)
 
 
 def platforms_available(*platforms):
@@ -55,8 +57,8 @@ def _long_while(it, x, y):
 
 class ProfileReadingTest(absltest.TestCase):
   def test_parsing_multiple_profiles_on_gpu(self):
-    if not TEST_KERNELS:
-      self.skipTest(f"Skipping pallas kernels since {TEST_KERNELS=}")
+    if not TEST_WITH_PALLAS:
+      self.skipTest(f"Skipping pallas kernels since {TEST_WITH_PALLAS=}")
     if not platforms_available("gpu", "tpu"):
       self.skipTest("No GPU or TPU available")
     try:
