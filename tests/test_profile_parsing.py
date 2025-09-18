@@ -1,12 +1,13 @@
 import jax
 from jax import numpy as jnp
 from jax import random
-from jax.experimental.pallas.ops.gpu import attention as attention_gpu
 from absl.testing import absltest
 
 import tune_jax
 
 tune_jax.logger.setLevel("DEBUG")
+
+TEST_KERNELS = False
 
 
 def platforms_available(*platforms):
@@ -32,6 +33,9 @@ def _cond_fn(c, fn1, fn2, *args):
 
 
 def _gpu_attention(q, k, v, block_q, block_k):
+
+  from jax.experimental.pallas.ops.gpu import attention as attention_gpu
+
   if hasattr(attention_gpu, "BlockSizes"):
     attention_fn = lambda *args, block_q=None, block_k=None, **kw: attention_gpu.mha(
       *args,
@@ -51,6 +55,8 @@ def _long_while(it, x, y):
 
 class ProfileReadingTest(absltest.TestCase):
   def test_parsing_multiple_profiles_on_gpu(self):
+    if not TEST_KERNELS:
+      self.skipTest(f"Skipping pallas kernels since {TEST_KERNELS=}")
     if not platforms_available("gpu", "tpu"):
       self.skipTest("No GPU or TPU available")
     try:

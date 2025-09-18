@@ -10,16 +10,13 @@ import threading
 import tempfile
 import time
 import re
-import io
 from functools import partial, wraps
 from typing import Callable, Any
-from concurrent.futures import ThreadPoolExecutor, Future
+from concurrent.futures import ThreadPoolExecutor, Future, as_completed
 import logging
 from pprint import pformat
 from pathlib import Path
 import random as pyrandom
-import textwrap
-import inspect
 
 import jax
 import jax.core
@@ -37,7 +34,7 @@ try:
 except ModuleNotFoundError:
   tabulate_mod = None
 
-__all__ = ["tune", "record"]
+__all__ = ["tune"]
 
 TUNE_FN_PREFIX_FMT = "tune_jax_fn_{}"
 
@@ -47,6 +44,7 @@ class _Config:
   allow_fallback_timing: bool = True
   must_find_at_least_profiler_result_fraction: float = 0.5
   profiling_samples: int = 5
+  find_optimal_layouts_automatically: bool = False
 
 
 CONFIG = _Config()
@@ -66,6 +64,7 @@ _global_tuning_lock = threading.Lock()
 class CompileResult:
   status: bool
   error_msg: str | None = None
+  optimal_formats: Any = None
 
 
 @dataclasses.dataclass
@@ -102,17 +101,37 @@ def suppress_stdout_stderr():
   os.dup2(stdout, 1), os.dup2(stderr, 2)
 
 
-def _try_call(fn: Callable[[], None], args_val, kws_val, compile_only: bool = False) -> CompileResult:
+def _try_call(
+  fn: Callable[[], None],
+  args_val,
+  kws_val,
+  compile_only: bool = False,
+  compute_layouts: bool = False,
+  optimal_formats: Any | None = None,
+) -> CompileResult:
   """Attempt to call the function and return whether it compiles and runs."""
   try:
     if compile_only:
-      _ = jax.jit(fn).lower(*args_val, **kws_val).compile()
+      if compute_layouts:
+        to_shape = (
+          lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding) if isinstance(x, jax.Array) else x
+        )
+        (args_shapes, kws_shapes) = jax.tree.map(to_shape, (args_val, kws_val))
+        optimal_formats = jax.jit(fn).lower(*args_shapes, **kws_shapes).compile().input_formats
+        print(f"Optimal formats: {pformat(optimal_formats)}")
+      else:
+        _ = jax.jit(fn).lower(*args_val, **kws_val).compile()
     else:
-      _ = jax.block_until_ready(fn(*args_val, **kws_val))
-    return CompileResult(True, None)
+      if optimal_formats is not None:
+        place_if_array = lambda x, f: jax.device_put(x, f) if isinstance(x, jax.Array) else x
+        (optimal_args, optimal_kws) = jax.tree.map(place_if_array, (args_val, kws_val), optimal_formats)
+        _ = jax.block_until_ready(fn(*optimal_args, **optimal_kws))
+      else:
+        _ = jax.block_until_ready(fn(*args_val, **kws_val))
+    return CompileResult(True, None, optimal_formats)
   except Exception as _:
     msg = traceback.format_exc()
-    return CompileResult(False, msg)
+    return CompileResult(False, msg, optimal_formats)
 
 
 def _time_fn(fn: Callable[[], None], repeat: int = 5, number: int = 3) -> tuple[float, float]:
@@ -150,7 +169,7 @@ def _make_fn_to_time(
     return fn_to_tune(*args, **dict(kws, **hyperparams))
 
   _fn.__name__ = TUNE_FN_PREFIX_FMT.format(name_id)
-
+  _fn.__qualname__ = TUNE_FN_PREFIX_FMT.format(name_id)
   return jit_wrapper(_fn)
 
 
@@ -173,14 +192,15 @@ def _normalize_sharding(
 
 
 def _experimental_time_with_profiler(
-  _timing_closure: Callable[[], None], platform: str, total_calls_number: int
+  _timing_closure: Callable[[], None], platform: str, total_calls_number: int, event_filter_regex: str | None = None
 ) -> dict[int, tuple[float, float]]:
   function_timings = {}
-  for it in tqdm(range(total_calls_number), desc=f"Profiling {platform}", disable=logger.level > logging.INFO):
+  pbar = tqdm(range(total_calls_number), desc=f"Profiling {platform}", disable=logger.level > logging.INFO)
+  for it in pbar:
     now = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
     profile_path = Path(tempfile.mkdtemp(prefix=f"tuning_profile_{now}_")).absolute()
     if it == 0:
-      logger.debug("Saving optimization profile to `%s`", profile_path)
+      pbar.write(f"Saving optimization profile to `{profile_path}`")
     profile_path.mkdir(exist_ok=True)
     with suppress_stdout_stderr():
       with jax.profiler.trace(str(profile_path)):
@@ -191,14 +211,15 @@ def _experimental_time_with_profiler(
     latest_profile = profile_files[-1]
     profile_proto = profile_reader.parse_profile_from_bytes(latest_profile.read_bytes())
     device_plane_id = profile_reader.find_device_plane_ids(profile_proto, platform)[0]
-    profile_events = profile_reader.get_events_from_plane(profile_proto, device_plane_id, filter_prefix="jit_")
+    profile_events = profile_reader.get_events_from_plane(
+      profile_proto, device_plane_id, prefix_filter="jit_", event_filter_regex=event_filter_regex
+    )
     fn_format = f"jit_{TUNE_FN_PREFIX_FMT.format('([0-9]+)')}.*"
     for k, durations in profile_events.items():
       if not re.match(fn_format, k):
         continue
       key = int(re.match(fn_format, k)[1])
-      assert len(durations) == 1, "We are expecting a single call per profile"
-      function_timings.setdefault(key, []).extend(durations)
+      function_timings.setdefault(key, []).append(durations)
 
   for key, durations in function_timings.items():
     if len(durations) > 2:
@@ -276,142 +297,6 @@ def to_df(timing_results: dict[int, TimingResult] | Callable):
   return pd.DataFrame(data, index=index, columns=columns[1:])
 
 
-def codegen_a_tuning_script(fn: Callable, args: tuple, kws: dict, dir_or_buffer: str | io.IOBase | None):
-  qualname, module, fname, source_code = fn.__qualname__, fn.__module__, fn.__name__, inspect.getsource(fn)
-
-  class Literal:  # allows pformat to interpolate strings like my_name instead of "my_name"
-    def __init__(self, val: Any):
-      self.val = val
-
-    def __repr__(self) -> str:
-      return self.val
-
-  total_arrays = 0
-
-  def init_obj(x):
-    nonlocal total_arrays
-    _normal_init = "random.normal(next(keys), {shape}, dtype='{dtype}')"
-    _const_init = "jnp.full({shape}, {value}, dtype='{dtype}')"
-    if isinstance(x, jax.Array):
-      total_arrays += 1
-      try:
-        local_shape = x.sharding.shard_shape(x.shape)
-      except AttributeError:
-        local_shape = x.shape
-      if jnp.issubdtype(x.dtype, jnp.floating):
-        return Literal(_normal_init.format(shape=str(local_shape), dtype=x.dtype.name))
-      else:
-        return Literal(_const_init.format(shape=local_shape, value=1, dtype=x.dtype))
-    else:
-      return Literal(str(x))
-
-  args_init, kw_init = jax.tree.map(init_obj, args), jax.tree.map(init_obj, kws)
-  if "<locals>" not in qualname:
-    import_statement = f"from {module} import {fname}"
-  else:
-    import_statement = textwrap.dedent(source_code)
-    if "<lambda>" in qualname:  # strip all before the first "lambda" in the source code and give it a name
-      fname = "my_lambda"
-      import_statement = f"{fname} = {import_statement[max(import_statement.find('lambda'), 0) :].lstrip()}"
-  code = f"""
-from functools import partial
-
-import jax
-import jax.numpy as jnp
-from jax import random
-from jax.experimental.layout import Format, Layout
-
-import tune_jax
-
-# your function #########################################
-# (some imports might be missing)
-{import_statement.strip()}
-
-# hyperparameters #######################################
-hyperparams = {{
-    # FILL ME IN
-}}
-
-# random inputs #########################################
-# (hyperparameters have been wrongly placed in the args/kws)
-keys = iter(random.split(random.key(0), {total_arrays}))
-args = {textwrap.indent(pformat(args_init, width=120), " " * 7).strip()}
-kws = {textwrap.indent(pformat(kw_init, width=120), " " * 6).strip()}
-
-# optimal layouts microbenchmarking #####################
-xs_flat, xs_struct = jax.tree.flatten((args, kws))
-xs_arr = [x if isinstance(x, jax.Array) else None for x in xs_flat]
-xs_obj = [x if not isinstance(x, jax.Array) else None for x in xs_flat]
-
-def fn_flat(*xs_arr_flat):
-  xs_flat = [x if x is not None else y for x, y in zip(xs_arr_flat, xs_obj)]
-  args_, kws_ = jax.tree.unflatten(xs_struct, xs_flat)
-  fn_with_hyperparams = partial({fname}, )  # FILL ME IN: hyperparams that will definitely compile
-  return fn_with_hyperparams(*args_, **kws_)
-
-shapes = [jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding) if x is not None else None for x in xs_arr]
-formats_flat = jax.jit(fn_flat, in_shardings=Format(Layout.AUTO)).lower(*xs_arr).compile().input_formats[0]
-formats = jax.tree.unflatten(xs_struct, formats_flat)
-
-(args, kws) = jax.tree.map(lambda x, l: jax.device_put(x, l) if l is not None else x, (args, kws), formats)
-
-# tuning ################################################
-fn = tune_jax.tune({fname}, hyperparams=hyperparams)
-fn(*args, **kws)
-print(tune_jax.tabulate(fn))
-"""
-  if dir_or_buffer is None:
-    logger.info("Auto-tuning script " + "-" * 61 + "\n" + code + "\n" + "-" * 80)
-  elif isinstance(dir_or_buffer, io.TextIOBase):
-    dir_or_buffer.write(code)
-  elif isinstance(dir_or_buffer, io.IOBase):
-    dir_or_buffer.write(code.encode())
-  elif hasattr(dir_or_buffer, "write"):
-    dir_or_buffer.write(code)
-  else:
-    path = Path(dir_or_buffer).expanduser().absolute()
-    path.mkdir(exist_ok=True, parents=True)
-    assert path.exists()
-    tuning_filename = str(time.time_ns())
-    tuning_path = path / (f"{re.sub(r'(<|>)', '_', qualname)}_{tuning_filename}.py")
-    tuning_path.write_text(code)
-
-
-def record(fn: Callable, dir_or_buffer: str | io.IOBase | None = None):
-  """Record a function call (under jit is ok) to remember its input arguments shapes for tuning.
-
-  Example:
-    ```
-    @tune_jax.record
-    def my_library_function(...):
-        ...
-    ```
-
-  Optionally codegen a simple tuning template script.
-  """
-  seen_hashes = {}
-
-  @wraps(fn)
-  def _recorded_fn(*args, **kws):
-    nonlocal seen_hashes
-    input_hash = _try_hash_input(args, kws, must_be_concrete=False)
-    if input_hash is not None and input_hash not in seen_hashes:
-      seen_hashes[input_hash] = True
-      fn_: Callable = fn
-      while hasattr(fn_, "_fun"):  # unpack PjitFunctions, it's jitted
-        fn_ = getattr(fn_, "_fun")
-      module, fname, code = fn_.__module__, fn_.__name__, fn_.__code__
-      recorded_args = jax.tree.map(lambda x: x if not isinstance(x, jax.Array) else jax.typeof(x), args)
-      recorded_kws = jax.tree.map(lambda x: x if not isinstance(x, jax.Array) else jax.typeof(x), kws)
-      args_str = ", ".join(map(pformat, recorded_args))
-      kw_str = ", ".join([f"{k}={pformat(v)}" for k, v in recorded_kws.items()])
-      logger.info(f"Called {code.co_filename}:{code.co_firstlineno}\n{module}.{fname}({', '.join([args_str, kw_str])})")
-      codegen_a_tuning_script(fn_, args, kws, dir_or_buffer)
-    return fn(*args, **kws)
-
-  return _recorded_fn
-
-
 def tune(
   fn_to_tune: Callable[..., Any],
   hyperparams: dict[Any, Any] | None = None,
@@ -422,6 +307,7 @@ def tune(
   example_args: tuple[Any] | None = None,
   example_kws: dict[Any, Any] | None = None,
   sample_num: int = 2**63 - 1,
+  event_filter_regex: str | None = None,
 ):
   """Tune a function with hyperparameters, even if some fail to compile.
 
@@ -435,6 +321,7 @@ def tune(
       example_args (tuple[Any] | None, optional): Exact example_args to tune with, on correct device.
       example_kws (dict[Any, Any] | None, optional): Exact example_kws to tune with, on correct device.
       sample_num (int | float): Number of samples used for tuning. Defaults to full cartesian product (all samples).
+      event_filter_regex (str | None): A regex to count only matching events into the runtime.
   """
 
   hyperparams_ = hyperparams if hyperparams is not None else dict()
@@ -490,23 +377,33 @@ def tune(
 
     with _global_tuning_lock:
       # filter hyperparameters for those that compile ##########################
+      optimal_formats = {}
       for it in range(2):  # sometimes a kernel compiles once, but not twice
-        compiles: dict[int, Future[CompileResult]] = dict()
+        compile_only, find_optimal_layouts = (it == 0), CONFIG.find_optimal_layouts_automatically
+        compiles: dict[Future[CompileResult], int] = dict()
         for i, vals in hyperparam_settings.items():
           hs = dict(zip(hyperparams_norm.keys(), vals, strict=True))
           fns[i] = _make_fn_to_time(fn_to_tune, hs, out_shardings=out_shardings, name_id=i)
           # first time, try compiling only (to check if lowering and compilation are error free)
-          compiles[i] = executor.submit(
-            lambda fn, args_val, kws_val: _try_call(fn, args_val, kws_val, it == 0), fns[i], args_val, kws_val
-          )
-        future_pbar = tqdm(
-          compiles.items(), total=len(compiles), disable=logger.level > logging.INFO, desc="Compiling..."
-        )
-        successful_compiles = {k: x.result() for (k, x) in future_pbar if x.result().status}
-        if len(successful_compiles) == len(hyperparam_settings):
-          break
+          opts = dict(optimal_formats=optimal_formats.get(i, None), compute_layouts=find_optimal_layouts)
+          compiles[executor.submit(_try_call, fns[i], args_val, kws_val, compile_only=compile_only, **opts)] = i
+
+        # collect compiled results
+        future_pbar = tqdm(total=len(compiles), disable=logger.level > logging.INFO, desc="Compiling...")
+        successful_compiles = {}
+        for fut in as_completed(compiles):
+          result = fut.result()
+          if result.status:
+            successful_compiles[compiles[fut]] = result
+          future_pbar.update(1)
+        future_pbar.close()
+
+        # analyze compiled results
+        if compile_only and find_optimal_layouts:
+          for k, x in successful_compiles.items():
+            optimal_formats[k] = x.optimal_formats
         if len(successful_compiles) == 0:
-          for i, compile_result in compiles.items():
+          for compile_result, i in compiles.items():
             logger.error(
               f"Hyperparameters {hyperparam_settings[i]} failed to compile with message:"
               f"\n{compile_result.result().error_msg}"
@@ -531,9 +428,11 @@ def tune(
         hs = list(hyperparam_settings.items())
         pyrandom.shuffle(hs)
         for i, _ in hs:
-          _time_fn(partial(lambda fn: fn(*args_val, **kws_val), fns[i]), repeat=1, number=1)
+          _try_call(fns[i], args_val, kws_val, compile_only=False, optimal_formats=optimal_formats.get(i, None))
 
-      profiler_timings = _experimental_time_with_profiler(_timing_closure, platform, CONFIG.profiling_samples)
+      profiler_timings = _experimental_time_with_profiler(
+        _timing_closure, platform, CONFIG.profiling_samples, event_filter_regex=event_filter_regex
+      )
       fraction_measured = sum(1 for i in hyperparam_settings.keys() if i in profiler_timings) / len(hyperparam_settings)
       if fraction_measured < CONFIG.must_find_at_least_profiler_result_fraction:
         msg = "Could not find profiler results for some hyperparameter settings:"
@@ -548,8 +447,9 @@ def tune(
       for i, hs in hyperparam_settings.items():
         hs = dict(zip(hyperparams_norm.keys(), hs, strict=True))
         results[i] = TimingResult(hs, *profiler_timings[i])
-    except Exception as _:
+    except Exception as e:
       if not CONFIG.allow_fallback_timing:
+        print(traceback.format_exc())
         raise RuntimeError(f"Need to fall back to the python-level timing, but {CONFIG=} prohibits it.")
       # old timing fallback
       logger.warning(traceback.format_exc())
@@ -565,6 +465,9 @@ def tune(
     logger.debug("\n" + (tabulate(dict(results)) if tabulate_mod is not None else pformat(dict(results), width=300)))
     logger.debug(f"optimal hyperparams: {optimal_hyperparams}")
     return fns[idx], optimal_hyperparams, results
+
+  if hasattr(fn_to_tune, "timing_result"):
+    raise ValueError("Wrapping a `tune`d function in the `tune` decorator the second time is not supported.")
 
   @wraps(fn_to_tune)
   def wrapped_fn(*args, **kws):
@@ -613,7 +516,7 @@ def test_main():
   )
 
   tuned_mha = tune(attention_wrapper, hyperparams=hyperparams, sample_num=5)
-  tuned_mha_jit = record(jax.jit(tuned_mha), codegen_tuning_script_dir="/tmp/tuning_mha")
+  tuned_mha_jit = jax.jit(tuned_mha)
 
   logger.setLevel("DEBUG")
 

@@ -1,7 +1,9 @@
-import tempfile
 from typing import Any
 from pathlib import Path
+import re
 from pprint import pprint
+
+import numpy as np
 
 XSpace = Any
 
@@ -38,26 +40,27 @@ def _parse_stats(stats, stat_metadata):
   return dict(stats)
 
 
-def _parse_event(event, event_metadata, stat_metadata, prefix_filter: str = ""):
+def _parse_event(event, event_metadata, stat_metadata, prefix_filter: str = "", line_name: str = ""):
   if event_metadata is not None:
     name = event_metadata[event.metadata_id].name
   else:
     name = event.name
   stats = _parse_stats(event.stats, stat_metadata)
   name = stats.get("hlo_module", name)  # hlo_module is GPU, name is TPU
-  if not name.startswith(prefix_filter):
-    return None
+  # if not name.startswith(prefix_filter):
+  #  return None
   program_id = stats.get("program_id", stats.get("run_id"))  # program_id is GPU, run_id is TPU
-  key = f"{name}({program_id})"
+  scope_range_id = stats.get("scope_range_id", "None")
+  key = f"{name}({program_id}-{scope_range_id})"
   if hasattr(event, "duration_ps"):
-    stats["start_ps"] = event.offset_ps
-    stats["end_ps"] = event.offset_ps + event.duration_ps
-    stats["duration_ps"] = event.duration_ps
+    stats["start_ps"] = int(event.offset_ps)
+    stats["end_ps"] = int(event.offset_ps) + int(event.duration_ps)
+    stats["duration_ps"] = int(event.duration_ps)
   else:
-    stats["start_ps"] = event.start_ns * 1e3
-    stats["end_ps"] = (event.start_ns + event.duration_ns) * 1e3
-    stats["duration_ps"] = event.duration_ns * 1e3
-  return dict(jax_fn_name=key, fusion=name, **stats)
+    stats["start_ps"] = int(event.start_ns * 1000)
+    stats["end_ps"] = int(event.start_ns * 1000) + int(event.duration_ns * 1000)
+    stats["duration_ps"] = int(event.duration_ns * 1000)
+  return dict(unified_name=key, fusion=name, line_name=line_name, **stats)
 
 
 def parse_profile_from_bytes(profile_bytes: bytes) -> ProfileData:
@@ -72,7 +75,41 @@ def find_device_plane_ids(p: XSpace, device_str: str) -> list[int]:
   return [i for i, plane in enumerate(p.planes) if device_str.lower() in plane.name.lower()]
 
 
-def get_events_from_plane(p, plane_idx, verbose: bool = False, filter_prefix: str = "") -> dict[str, list[float]]:
+def _find_children(own_name: str, start_ps: int, end_ps: int, events_sorted: list[dict[str, Any]]):
+  """Find all events that are fully subsumed by the `start_ps` - `end_ps` range."""
+  idx = np.searchsorted(np.sort(np.array([event["start_ps"] for event in events_sorted])), start_ps - 1)
+  children = []
+  while idx < len(events_sorted) and events_sorted[idx]["start_ps"] <= end_ps:
+    ts, te = events_sorted[idx]["start_ps"], events_sorted[idx]["end_ps"]
+    if ts >= start_ps and te <= end_ps and events_sorted[idx]["unified_name"] != own_name:
+      children.append(events_sorted[idx])
+    idx += 1
+  return children
+
+
+def _sum_events(events):
+  """Sum the time of all events as right extreme - left extreme subtracting empty space."""
+  if len(events) == 0:
+    return 0
+  if len(events) == 1:
+    return events[0]["end_ps"] - events[0]["start_ps"]
+  starts, ends = np.array([e["start_ps"] for e in events]), np.array([e["end_ps"] for e in events])
+  min_start, max_end = int(np.min(starts)), int(np.max(ends))
+  sorted_ends = np.sort(ends)
+  empty_ends = np.where(
+    ~np.any((sorted_ends[None, :-1] < ends[:, None]) & (sorted_ends[None, :-1] >= starts[:, None]), axis=0)
+  )[0]
+  sorted_starts = np.sort(starts)
+  empty_space = sum(
+    int(ends[end_idx]) - int(sorted_starts[np.searchsorted(sorted_starts, ends[end_idx])]) for end_idx in empty_ends
+  )
+  assert empty_space < (max_end - min_start)
+  return max_end - min_start - empty_space
+
+
+def get_events_from_plane(
+  p, plane_idx, prefix_filter: str = "", event_filter_regex: str | None = None
+) -> dict[str, list[float]]:
   """Returns a dict of xla module names (for unique inputs) to a list of their execution time in seconds."""
 
   planes = list(p.planes)
@@ -83,39 +120,29 @@ def get_events_from_plane(p, plane_idx, verbose: bool = False, filter_prefix: st
     event_metadata, stat_metadata = None, None
   all_parsed_events = []
   for line in planes[plane_idx].lines:
-    parsed_events = [_parse_event(event, event_metadata, stat_metadata, filter_prefix) for event in line.events]
+    parsed_events = [
+      _parse_event(event, event_metadata, stat_metadata, prefix_filter, line_name=line.name) for event in line.events
+    ]
     parsed_events = [event for event in parsed_events if event is not None]
     all_parsed_events.extend(parsed_events)
 
-    xla_modules = {}
-    for event in parsed_events:
-      xla_modules.setdefault(event["jax_fn_name"], []).append(event)
-    xla_modules = {
-      k: (max([e["end_ps"] for e in event_list], default=0) - min([e["start_ps"] for e in event_list], default=0))
-      / 1e12
-      for k, event_list in xla_modules.items()
-    }
-    grouped_timings = {}
-    for xla_module_name, duration in xla_modules.items():
-      grouped_timings.setdefault(xla_module_name, []).append(duration)
-    timed_events |= grouped_timings
+  sorted_events = sorted(all_parsed_events, key=lambda x: x["start_ps"])
 
-  # debuggging ###################################################################################
-  if verbose:
-    all_keys = set()
-    for e in all_parsed_events:
-      all_keys |= set(e.keys())
-    keys_order = list(all_parsed_events[0].keys())
-    all_keys = sorted(all_keys, key=lambda k: keys_order.index(k) if k in keys_order else 1e20)
-
-    from tabulate import tabulate
-
-    dump = tabulate([[e.get(k, "None") for k in all_keys] for e in all_parsed_events], headers=all_keys)
-    with tempfile.NamedTemporaryFile(delete=False) as f:
-      Path(f.name).absolute().write_text(dump)
-      print(f"Dumped parsed events to {Path(f.name).absolute()}")
-  # debuggging ###################################################################################
-
+  filtered_events = []
+  for event in all_parsed_events:
+    if event["unified_name"].startswith(prefix_filter):
+      event["children"] = _find_children(event["unified_name"], event["start_ps"], event["end_ps"], sorted_events)
+      if event_filter_regex is not None:
+        # an alternative timing method, look for children based on the regex pattern
+        # and sum all children events times subtracting empty space: len(|---|    |-||--|) = 6
+        new_children = [ch for ch in event["children"] if re.search(event_filter_regex, ch["unified_name"]) is not None]
+        event["children"] = new_children
+        event["children_duration"] = _sum_events(new_children)
+      filtered_events.append(event)
+  timed_events = {
+    event["unified_name"]: event.get("children_duration", (event["end_ps"] - event["start_ps"])) / 1e12
+    for event in filtered_events
+  }
   return timed_events
 
 
