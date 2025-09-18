@@ -12,7 +12,7 @@ import tune_jax
 
 tune_jax.logger.setLevel("DEBUG")
 
-RUN_KERNELS = True
+TEST_KERNELS = True
 
 
 def platforms_available(*platforms):
@@ -27,8 +27,8 @@ def platforms_available(*platforms):
 
 class SplashCasesTest(absltest.TestCase):
   def test_tune_splash(self):
-    if not RUN_KERNELS:
-      self.skipTest("Skipping pallas kernels if not specified.")
+    if not TEST_KERNELS:
+      self.skipTest(f"Skipping pallas kernels since {TEST_KERNELS=}")
 
     if not platforms_available("tpu"):
       self.skipTest("Splash attention requires a TPU.")
@@ -149,8 +149,8 @@ class SimpleCasesTest(absltest.TestCase):
     assert C.shape[-1] == min(hyperparams["n"])
 
   def test_simple_mha(self):
-    if not RUN_KERNELS:
-      self.skipTest("Skipping pallas kernels if not specified.")
+    if not TEST_KERNELS:
+      self.skipTest(f"Skipping pallas kernels since {TEST_KERNELS=}")
     if not platforms_available("gpu"):
       self.skipTest("No GPU available")
 
@@ -199,8 +199,8 @@ class SimpleCasesTest(absltest.TestCase):
       self.assertEqual(list(out.devices())[0].platform.lower(), "cpu")
 
   def test_multidevice(self):
-    if not RUN_KERNELS:
-      self.skipTest("Skipping pallas kernels if not specified.")
+    if not TEST_KERNELS:
+      self.skipTest(f"Skipping pallas kernels since {TEST_KERNELS=}")
     if not platforms_available("gpu"):
       self.skipTest("No GPU available")
 
