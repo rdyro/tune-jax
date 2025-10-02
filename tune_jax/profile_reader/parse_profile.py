@@ -22,6 +22,10 @@ else:
 
 __all__ = ["parse_profile_from_bytes", "find_device_plane_ids", "get_events_from_plane"]
 
+# profiler event times can be slightly inaccurate
+# when looking whether an event is contained entirely under another event (a child), use a relaxation tolerance
+EVENT_CHILD_TOLERANCE_PS = 2000  # 2 ns
+
 
 def _get_stat_value(stat, metadata):
   if stat.ref_value != 0:
@@ -77,11 +81,13 @@ def find_device_plane_ids(p: XSpace, device_str: str) -> list[int]:
 
 def _find_children(own_name: str, start_ps: int, end_ps: int, events_sorted: list[dict[str, Any]]):
   """Find all events that are fully subsumed by the `start_ps` - `end_ps` range."""
-  idx = np.searchsorted(np.sort(np.array([event["start_ps"] for event in events_sorted])), start_ps - 1)
+  t0 = start_ps - EVENT_CHILD_TOLERANCE_PS - 1
+  idx = np.searchsorted(np.sort(np.array([event["start_ps"] for event in events_sorted])), t0)
   children = []
-  while idx < len(events_sorted) and events_sorted[idx]["start_ps"] <= end_ps:
+  while idx < len(events_sorted) and events_sorted[idx]["start_ps"] <= end_ps + EVENT_CHILD_TOLERANCE_PS:
     ts, te = events_sorted[idx]["start_ps"], events_sorted[idx]["end_ps"]
-    if ts >= start_ps and te <= end_ps and events_sorted[idx]["unified_name"] != own_name:
+    is_contained = ts >= start_ps - EVENT_CHILD_TOLERANCE_PS and te <= end_ps + EVENT_CHILD_TOLERANCE_PS
+    if is_contained and events_sorted[idx]["unified_name"] != own_name:
       children.append(events_sorted[idx])
     idx += 1
   return children

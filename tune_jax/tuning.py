@@ -17,6 +17,7 @@ import logging
 from pprint import pformat
 from pathlib import Path
 import random as pyrandom
+from collections import defaultdict
 
 import jax
 import jax.core
@@ -41,10 +42,18 @@ TUNE_FN_PREFIX_FMT = "tune_jax_fn_{}"
 
 @dataclasses.dataclass
 class _Config:
+  # whether to error if we need to fall back to python timing
   allow_fallback_timing: bool = True
+  # valid parsed event ratio threshold at which to abort profile parsing
+  # for instance if only 3 out of 10 profiled events parsed correctly
+  # and the fraction is set to 0.4, we abort and fall back to Python timing
   must_find_at_least_profiler_result_fraction: float = 0.5
+  # how many profiling samples to take for profile parsing
   profiling_samples: int = 5
+  # whether to attempt to compute optimal layouts for the function
   find_optimal_layouts_automatically: bool = False
+  # whether to mark events that come back as 0.0 seconds as invalid
+  _reject_zero_time_events: bool = True
 
 
 CONFIG = _Config()
@@ -194,7 +203,7 @@ def _normalize_sharding(
 def _experimental_time_with_profiler(
   _timing_closure: Callable[[], None], platform: str, total_calls_number: int, event_filter_regex: str | None = None
 ) -> dict[int, tuple[float, float]]:
-  function_timings = {}
+  function_timings = defaultdict(list)
   pbar = tqdm(range(total_calls_number), desc=f"Profiling {platform}", disable=logger.level > logging.INFO)
   for it in pbar:
     now = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
@@ -215,11 +224,12 @@ def _experimental_time_with_profiler(
       profile_proto, device_plane_id, prefix_filter="jit_", event_filter_regex=event_filter_regex
     )
     fn_format = f"jit_{TUNE_FN_PREFIX_FMT.format('([0-9]+)')}.*"
-    for k, durations in profile_events.items():
+    for k, duration in profile_events.items():
       if not re.match(fn_format, k):
         continue
       key = int(re.match(fn_format, k)[1])
-      function_timings.setdefault(key, []).append(durations)
+      if (not CONFIG._reject_zero_time_events) or duration > 0:
+        function_timings[key].append(duration)
 
   for key, durations in function_timings.items():
     if len(durations) > 2:
