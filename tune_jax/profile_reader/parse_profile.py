@@ -2,6 +2,7 @@ from typing import Any
 from pathlib import Path
 import re
 from pprint import pprint
+from collections import defaultdict
 
 import numpy as np
 
@@ -149,6 +150,22 @@ def get_events_from_plane(
     event["unified_name"]: event.get("children_duration", (event["end_ps"] - event["start_ps"])) / 1e12
     for event in filtered_events
   }
+
+  # on GPU we need to sum multiple scopes belonging to the same event based on the name and program id
+  # NOTE: this assumes the program is called only once in the trace
+  if "gpu" in planes[plane_idx].name.lower():
+    combined_timed_events = defaultdict(lambda: 0.0)
+    to_delete = []
+    program_regex = r"(.*?)\(([0-9]+)-[0-9]+\)"
+    for unified_name, duration in timed_events.items():
+      if (m := re.match(program_regex, unified_name)) is not None:
+        program_str, program_id = m[1], m[2]
+        combined_timed_events[f"{program_str}({program_id})"] += duration
+        to_delete.append(unified_name)
+    for unified_name in to_delete:
+      del timed_events[unified_name]
+    timed_events |= combined_timed_events
+
   return timed_events
 
 
