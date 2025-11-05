@@ -1,6 +1,6 @@
 [project]
 name = "tune_jax"
-version = "0.5.8"
+version = "0.5.9"
 authors = [{ name = "Robert Dyro" }]
 dependencies = ["jax", "numpy", "tqdm", "protobuf", "tabulate"]
 description = "Microbenchmarking hyperparameter tuning for JAX functions."

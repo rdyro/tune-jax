@@ -102,16 +102,17 @@ def _sum_events(events):
     return events[0]["end_ps"] - events[0]["start_ps"]
   starts, ends = np.array([e["start_ps"] for e in events]), np.array([e["end_ps"] for e in events])
   min_start, max_end = int(np.min(starts)), int(np.max(ends))
-  sorted_ends = np.sort(ends)
-  empty_ends = np.where(
-    ~np.any((sorted_ends[None, :-1] < ends[:, None]) & (sorted_ends[None, :-1] >= starts[:, None]), axis=0)
+  sorted_starts, sorted_ends = np.sort(starts), np.sort(ends)
+  # find which of the potential endpoints (sorted_ends[:-1]) do NOT fall within any event's duration
+  empty_end_indices = np.where(
+      ~np.any((sorted_ends[None, :-1] < ends[:, None]) & (sorted_ends[None, :-1] >= starts[:, None]), axis=0)
   )[0]
-  sorted_starts = np.sort(starts)
-  empty_space = sum(
-    int(ends[end_idx]) - int(sorted_starts[np.searchsorted(sorted_starts, ends[end_idx])]) for end_idx in empty_ends
-  )
+  gap_start_values = sorted_ends[empty_end_indices]
+  next_start_indices = np.searchsorted(sorted_starts, gap_start_values)  # starts of the next event block for each gap
+  gap_end_values = sorted_starts[next_start_indices]
+  empty_space = np.sum(gap_end_values - gap_start_values)
   assert empty_space < (max_end - min_start)
-  return max_end - min_start - empty_space
+  return int(max_end - min_start - empty_space)
 
 
 def get_events_from_plane(
