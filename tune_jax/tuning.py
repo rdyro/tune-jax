@@ -90,6 +90,14 @@ class _UnspecifiedT:
 UNSPECIFIED = _UnspecifiedT()
 
 
+def _get_local_mesh():
+  from jax._src import config
+
+  if hasattr(getattr(config, "device_context", None), "get_local"):
+    mesh = config.device_context.get_local()
+  return mesh if isinstance(mesh, jax.sharding.Mesh) else None
+
+
 def _get_global_mesh():
   env = pxla.thread_resources.env
   mesh = env.physical_mesh
@@ -117,8 +125,11 @@ def _try_call(
   compile_only: bool = False,
   compute_layouts: bool = False,
   optimal_formats: Any | None = None,
+  mesh: Any | None = None,
 ) -> CompileResult:
   """Attempt to call the function and return whether it compiles and runs."""
+  if mesh is not None:
+    jax.sharding.set_mesh(mesh)
   try:
     if compile_only:
       if compute_layouts:
@@ -200,16 +211,16 @@ def _normalize_sharding(
     return SingleDeviceSharding(default_device)
 
 
-def _experimental_time_with_profiler(
+def _time_with_profiler(
   _timing_closure: Callable[[], None], platform: str, total_calls_number: int, event_filter_regex: str | None = None
 ) -> dict[int, tuple[float, float]]:
+  now = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
+  profile_path = Path(tempfile.mkdtemp(prefix=f"tuning_profile_{now}_")).absolute()
+  pbar = tqdm(
+    range(total_calls_number), desc=f"Profiling {platform}: {profile_path}", disable=logger.level > logging.INFO
+  )
   function_timings = defaultdict(list)
-  pbar = tqdm(range(total_calls_number), desc=f"Profiling {platform}", disable=logger.level > logging.INFO)
-  for it in pbar:
-    now = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-    profile_path = Path(tempfile.mkdtemp(prefix=f"tuning_profile_{now}_")).absolute()
-    if it == 0:
-      pbar.write(f"Saving optimization profile to `{profile_path}`")
+  for _ in pbar:
     profile_path.mkdir(exist_ok=True)
     with suppress_stdout_stderr():
       with jax.profiler.trace(str(profile_path)):
@@ -230,6 +241,7 @@ def _experimental_time_with_profiler(
       key = int(re.match(fn_format, k)[1])
       if (not CONFIG._reject_zero_time_events) or duration > 0:
         function_timings[key].append(duration)
+    profile_path = Path(tempfile.mkdtemp(prefix=f"tuning_profile_{now}_")).absolute()  # new path for the next iteration
 
   for key, durations in function_timings.items():
     if len(durations) > 2:
@@ -385,6 +397,8 @@ def tune(
     if len(hyperparam_settings) == 0:
       hyperparam_settings[0] = []  # allow no hyperparamters to tune, just time the function
 
+    local_mesh = _get_local_mesh()  # temporary support for jax.sharding.set_mesh, TODO: revisit
+
     with _global_tuning_lock:
       # filter hyperparameters for those that compile ##########################
       optimal_formats = {}
@@ -395,7 +409,9 @@ def tune(
           hs = dict(zip(hyperparams_norm.keys(), vals, strict=True))
           fns[i] = _make_fn_to_time(fn_to_tune, hs, out_shardings=out_shardings, name_id=i)
           # first time, try compiling only (to check if lowering and compilation are error free)
-          opts = dict(optimal_formats=optimal_formats.get(i, None), compute_layouts=find_optimal_layouts)
+          opts = dict(
+            optimal_formats=optimal_formats.get(i, None), compute_layouts=find_optimal_layouts, mesh=local_mesh
+          )
           compiles[executor.submit(_try_call, fns[i], args_val, kws_val, compile_only=compile_only, **opts)] = i
 
         # collect compiled results
@@ -440,7 +456,7 @@ def tune(
         for i, _ in hs:
           _try_call(fns[i], args_val, kws_val, compile_only=False, optimal_formats=optimal_formats.get(i, None))
 
-      profiler_timings = _experimental_time_with_profiler(
+      profiler_timings = _time_with_profiler(
         _timing_closure, platform, CONFIG.profiling_samples, event_filter_regex=event_filter_regex
       )
       fraction_measured = sum(1 for i in hyperparam_settings.keys() if i in profiler_timings) / len(hyperparam_settings)
