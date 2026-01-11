@@ -45,18 +45,19 @@ def _parse_stats(stats, stat_metadata):
   return dict(stats)
 
 
-def _parse_event(event, event_metadata, stat_metadata, prefix_filter: str = "", line_name: str = ""):
+def _parse_event(event, event_metadata, stat_metadata, line_name: str = "", include_scope_range_id: bool = False):
   if event_metadata is not None:
     name = event_metadata[event.metadata_id].name
   else:
     name = event.name
   stats = _parse_stats(event.stats, stat_metadata)
   name = stats.get("hlo_module", name)  # hlo_module is GPU, name is TPU
-  # if not name.startswith(prefix_filter):
-  #  return None
   program_id = stats.get("program_id", stats.get("run_id"))  # program_id is GPU, run_id is TPU
-  scope_range_id = stats.get("scope_range_id", "None")
-  key = f"{name}({program_id}-{scope_range_id})"
+  if include_scope_range_id:
+    scope_range_id = stats.get("scope_range_id", "None")
+    key = f"{name}({program_id}-{scope_range_id})"
+  else:
+    key = f"{name}({program_id})"
   if hasattr(event, "duration_ps"):
     stats["start_ps"] = int(event.offset_ps)
     stats["end_ps"] = int(event.offset_ps) + int(event.duration_ps)
@@ -126,18 +127,33 @@ def get_events_from_plane(
     event_metadata, stat_metadata = planes[plane_idx].event_metadata, planes[plane_idx].stat_metadata
   else:
     event_metadata, stat_metadata = None, None
+
   all_parsed_events = []
   for line in planes[plane_idx].lines:
-    parsed_events = [
-      _parse_event(event, event_metadata, stat_metadata, prefix_filter, line_name=line.name) for event in line.events
-    ]
-    parsed_events = [event for event in parsed_events if event is not None]
+    parsed_events = [_parse_event(event, event_metadata, stat_metadata, line_name=line.name) for event in line.events]
     all_parsed_events.extend(parsed_events)
 
   sorted_events = sorted(all_parsed_events, key=lambda x: x["start_ps"])
+  del all_parsed_events
+
+  # on GPU we need to sum multiple scopes belonging to the same event based on the name and program id
+  # NOTE: this assumes the program is called only once in the trace
+  if "gpu" in planes[plane_idx].name.lower():
+    # the events will have the same names, we want to group them and create a fake parent event
+    # later logic will aggregate the children events under this fake parent
+    grouped_events = defaultdict(lambda: [])
+    for event in sorted_events:
+      grouped_events[event["unified_name"]].append(event)
+    for unified_name, events in grouped_events.items():
+      if len(events) > 1:
+        start_ps, end_ps = min(event["start_ps"] for event in events), max(event["end_ps"] for event in events)
+        sorted_events.append(dict(unified_name=unified_name, start_ps=start_ps, end_ps=end_ps))
+        for event in events:
+          event["unified_name"] = f"CHILD-{event['unified_name']}"
+    sorted_events = sorted(sorted_events, key=lambda x: x["start_ps"])  # resort events since we append parents now
 
   filtered_events = []
-  for event in all_parsed_events:
+  for event in sorted_events:
     if event["unified_name"].startswith(prefix_filter):
       event["children"] = _find_children(event["unified_name"], event["start_ps"], event["end_ps"], sorted_events)
       if event_filter_regex is not None:
@@ -151,22 +167,6 @@ def get_events_from_plane(
     event["unified_name"]: event.get("children_duration", (event["end_ps"] - event["start_ps"])) / 1e12
     for event in filtered_events
   }
-
-  # on GPU we need to sum multiple scopes belonging to the same event based on the name and program id
-  # NOTE: this assumes the program is called only once in the trace
-  if "gpu" in planes[plane_idx].name.lower():
-    combined_timed_events = defaultdict(lambda: 0.0)
-    to_delete = []
-    program_regex = r"(.*?)\(([0-9]+)-[0-9]+\)"
-    for unified_name, duration in timed_events.items():
-      if (m := re.match(program_regex, unified_name)) is not None:
-        program_str, program_id = m[1], m[2]
-        combined_timed_events[f"{program_str}({program_id})"] += duration
-        to_delete.append(unified_name)
-    for unified_name in to_delete:
-      del timed_events[unified_name]
-    timed_events |= combined_timed_events
-
   return timed_events
 
 
