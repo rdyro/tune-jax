@@ -1,6 +1,6 @@
 [project]
 name = "tune_jax"
-version = "0.6.1"
+version = "0.6.2"
 authors = [{ name = "Robert Dyro" }]
 dependencies = ["jax", "numpy", "tqdm", "protobuf", "tabulate"]
 description = "Microbenchmarking hyperparameter tuning for JAX functions."
@@ -13,6 +13,9 @@ test = ["absl-py", "pytest"]
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["tune_jax*"]
 
 [tool.ruff]
 preview = true

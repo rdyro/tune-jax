@@ -6,7 +6,6 @@ import jax
 from jax import numpy as jnp
 from jax import random
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
-from jax.experimental.layout import Format, Layout
 from absl.testing import absltest
 
 import tune_jax
@@ -28,6 +27,8 @@ def platforms_available(*platforms):
 
 class SplashCasesTest(absltest.TestCase):
   def test_tune_splash(self):
+    from jax.experimental.layout import Format, Layout
+
     if not TEST_WITH_PALLAS:
       self.skipTest(f"Skipping pallas kernels since {TEST_WITH_PALLAS=}")
 

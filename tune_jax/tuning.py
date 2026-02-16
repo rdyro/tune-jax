@@ -91,6 +91,10 @@ UNSPECIFIED = _UnspecifiedT()
 
 
 def _get_local_mesh():
+  if hasattr(jax.sharding, "get_mesh"):
+    mesh = jax.sharding.get_mesh()
+    return None if mesh.empty else mesh
+
   from jax._src import config
 
   if hasattr(getattr(config, "device_context", None), "get_local"):
@@ -99,6 +103,10 @@ def _get_local_mesh():
 
 
 def _get_global_mesh():
+  if hasattr(jax.sharding, "get_mesh"):
+    mesh = jax.sharding.get_mesh()
+    return None if mesh.empty else mesh
+
   env = pxla.thread_resources.env
   mesh = env.physical_mesh
   return None if mesh.empty else mesh
@@ -128,30 +136,29 @@ def _try_call(
   mesh: Any | None = None,
 ) -> CompileResult:
   """Attempt to call the function and return whether it compiles and runs."""
-  if mesh is not None:
-    jax.sharding.set_mesh(mesh)
-  try:
-    if compile_only:
-      if compute_layouts:
-        to_shape = (
-          lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding) if isinstance(x, jax.Array) else x
-        )
-        (args_shapes, kws_shapes) = jax.tree.map(to_shape, (args_val, kws_val))
-        optimal_formats = jax.jit(fn).lower(*args_shapes, **kws_shapes).compile().input_formats
-        print(f"Optimal formats: {pformat(optimal_formats)}")
+  with (jax.sharding.set_mesh(mesh) if mesh is not None else contextlib.nullcontext()):
+    try:
+      if compile_only:
+        if compute_layouts:
+          to_shape = (
+            lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding) if isinstance(x, jax.Array) else x
+          )
+          (args_shapes, kws_shapes) = jax.tree.map(to_shape, (args_val, kws_val))
+          optimal_formats = jax.jit(fn).lower(*args_shapes, **kws_shapes).compile().input_formats
+          print(f"Optimal formats: {pformat(optimal_formats)}")
+        else:
+          _ = jax.jit(fn).lower(*args_val, **kws_val).compile()
       else:
-        _ = jax.jit(fn).lower(*args_val, **kws_val).compile()
-    else:
-      if optimal_formats is not None:
-        place_if_array = lambda x, f: jax.device_put(x, f) if isinstance(x, jax.Array) else x
-        (optimal_args, optimal_kws) = jax.tree.map(place_if_array, (args_val, kws_val), optimal_formats)
-        _ = jax.block_until_ready(fn(*optimal_args, **optimal_kws))
-      else:
-        _ = jax.block_until_ready(fn(*args_val, **kws_val))
-    return CompileResult(True, None, optimal_formats)
-  except Exception as _:
-    msg = traceback.format_exc()
-    return CompileResult(False, msg, optimal_formats)
+        if optimal_formats is not None:
+          place_if_array = lambda x, f: jax.device_put(x, f) if isinstance(x, jax.Array) else x
+          (optimal_args, optimal_kws) = jax.tree.map(place_if_array, (args_val, kws_val), optimal_formats)
+          _ = jax.block_until_ready(fn(*optimal_args, **optimal_kws))
+        else:
+          _ = jax.block_until_ready(fn(*args_val, **kws_val))
+      return CompileResult(True, None, optimal_formats)
+    except Exception as _:
+      msg = traceback.format_exc()
+      return CompileResult(False, msg, optimal_formats)
 
 
 def _time_fn(fn: Callable[[], None], repeat: int = 5, number: int = 3) -> tuple[float, float]:
