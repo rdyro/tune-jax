@@ -10,7 +10,7 @@ import threading
 import tempfile
 import time
 import re
-from functools import partial, wraps
+from functools import partial, wraps, lru_cache
 from typing import Callable, Any
 from concurrent.futures import ThreadPoolExecutor, Future, as_completed
 import logging
@@ -24,7 +24,7 @@ import jax.core
 from jax import numpy as jnp
 from jax import random
 from jax.interpreters import pxla
-from jax.sharding import PartitionSpec, Sharding, SingleDeviceSharding
+from jax.sharding import PartitionSpec, Sharding
 import numpy as np
 from tqdm import tqdm
 
@@ -95,8 +95,11 @@ def _get_local_mesh():
     mesh = jax.sharding.get_mesh()
     return None if mesh.empty else mesh
 
+  # pytype: disable=import-error
   from jax._src import config
+  # pytype: enable=import-error
 
+  mesh = None
   if hasattr(getattr(config, "device_context", None), "get_local"):
     mesh = config.device_context.get_local()
   return mesh if isinstance(mesh, jax.sharding.Mesh) else None
@@ -201,9 +204,7 @@ def _make_fn_to_time(
 
 
 def _normalize_sharding(
-  arg: jax.Array | np.ndarray | Any,
-  sharding_or_spec: PartitionSpec | Sharding | None,
-  default_device: jax.Device,
+  arg: jax.Array | np.ndarray | Any, sharding_or_spec: PartitionSpec | Sharding | None
 ):
   if not isinstance(arg, (jax.Array, np.ndarray)):
     return None
@@ -213,9 +214,9 @@ def _normalize_sharding(
   if isinstance(sharding_or_spec, PartitionSpec) and global_mesh is not None:
     return jax.NamedSharding(global_mesh, sharding_or_spec)
   elif isinstance(sharding_or_spec, PartitionSpec) and global_mesh is None:
-    raise ValueError("If specifying shardings via ParitionSpec, a global mesh must be defined")
+    raise ValueError("If specifying shardings via ParitionSpec, a global mesh must be set")
   else:
-    return SingleDeviceSharding(default_device)
+    return None
 
 
 def _time_with_profiler(
@@ -258,19 +259,22 @@ def _time_with_profiler(
   return function_timings
 
 
-@partial(jax.jit, static_argnames=("sds", "sharding"))
-def _get_random_value(sds, sharding=None):
+@lru_cache
+def _get_random_value_fn(sds):
   """Random values based on the tracer shape and dtype, and the sharding."""
 
-  if hasattr(sds, "shape") and hasattr(sds, "dtype"):
-    if jnp.issubdtype(sds.dtype, jnp.floating):
-      return jax.jit(lambda key: random.normal(key, sds.shape, sds.dtype), out_shardings=sharding)(random.key(0))
-    elif jnp.issubdtype(sds.dtype, jnp.integer):
-      return jax.jit(lambda: jnp.zeros(sds.shape, sds.dtype), out_shardings=sharding)()
+  def _fn(sds):
+    if hasattr(sds, "shape") and hasattr(sds, "dtype"):
+      if jnp.issubdtype(sds.dtype, jnp.floating):
+        return random.normal(random.key(0), sds.shape, sds.dtype)
+      elif jnp.issubdtype(sds.dtype, jnp.integer):
+        return jnp.zeros(sds.shape, sds.dtype)
+      else:
+        raise ValueError(f"Unsupported dtype {sds.dtype}")
     else:
-      raise ValueError(f"Unsupported dtype {sds.dtype}")
-  else:
-    return sds
+      return sds
+
+  return lambda: jax.tree.map(_fn, sds)
 
 
 def _try_hash_input(args, kws, must_be_concrete: bool = True):
@@ -359,6 +363,7 @@ def tune(
     """Main tuning method."""
 
     # resolve sharding and/or device placement #################################
+    local_mesh = _get_local_mesh()  # temporary support for jax.sharding.set_mesh, TODO: revisit
     _maybe_aval = lambda x: x if not isinstance(x, jax.Array) else jax.typeof(x)
     if len(args) == 0 or all(x is None or jax.core.is_concrete(x) for x in jax.tree.leaves(args)):
       logger.debug("All arguments are concrete, no need to pick random values.")
@@ -372,15 +377,17 @@ def tune(
         )
     else:
       logger.debug("Selecting random input arguments.")
-      resolved_device = device if isinstance(device, jax.Device) else _get_default_device()
-      if isinstance(resolved_device, str):  # in case the default device is a string `with jax.default_device("cpu"):`
-        resolved_device = jax.devices(resolved_device)[0]
-      shardings = in_shardings if in_shardings is not UNSPECIFIED else jax.tree.map(lambda _: None, args)
-      shardings = (shardings,) if len(args) == 1 else shardings
-      shardings = jax.tree.map(
-        partial(_normalize_sharding, default_device=resolved_device), tuple(args), tuple(shardings)
-      )
-      args_val = jax.tree.map(lambda x, s: _get_random_value(_maybe_aval(x), s), args, shardings)
+
+      if in_shardings is not UNSPECIFIED:
+        shardings = in_shardings
+        shardings = jax.tree.map(lambda s, x: jax.tree.map(lambda _: s, x), shardings, args)  # prefix-broadcast
+      else:
+        if local_mesh is not None and any(at == jax.sharding.AxisType.Explicit for at in local_mesh.axis_types):
+          shardings = jax.tree.map(lambda x: jax.typeof(x).sharding, args)
+        else:
+          shardings = jax.tree.map(lambda _: None, args)
+      shardings = jax.tree.map(_normalize_sharding, tuple(args), tuple(shardings))
+      args_val = jax.jit(_get_random_value_fn(jax.tree.map(_maybe_aval, args)), out_shardings=shardings)()
 
     if len(kws) == 0 or all(v is None or jax.core.is_concrete(v) for v in kws.values()):
       logger.debug("All keyword arguments are concrete, no need to pick random values.")
@@ -390,7 +397,7 @@ def tune(
       kws_val = example_kws
     else:
       logger.debug("Selecting random keyword arguments.")
-      kws_val = jax.tree.map(lambda x: _get_random_value(_maybe_aval(x)), kws)
+      kws_val = jax.jit(_get_random_value_fn(jax.tree.map(_maybe_aval, kws)), out_shardings=shardings)()
 
     hyperparams_norm = {k: (v if isinstance(v, (tuple, list)) else (v,)) for k, v in hyperparams_.items()}
     executor = ThreadPoolExecutor(max_workers=max_workers)
@@ -403,8 +410,6 @@ def tune(
       hyperparam_settings = dict([hyperparam_settings_[idx] for idx in sample_idx])
     if len(hyperparam_settings) == 0:
       hyperparam_settings[0] = []  # allow no hyperparamters to tune, just time the function
-
-    local_mesh = _get_local_mesh()  # temporary support for jax.sharding.set_mesh, TODO: revisit
 
     with _global_tuning_lock:
       # filter hyperparameters for those that compile ##########################
