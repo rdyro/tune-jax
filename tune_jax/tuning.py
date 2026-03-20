@@ -260,21 +260,24 @@ def _time_with_profiler(
 
 
 @lru_cache
-def _get_random_value_fn(sds):
+def _get_random_value(shape, dtype, sharding):
   """Random values based on the tracer shape and dtype, and the sharding."""
 
-  def _fn(sds):
-    if hasattr(sds, "shape") and hasattr(sds, "dtype"):
-      if jnp.issubdtype(sds.dtype, jnp.floating):
-        return random.normal(random.key(0), sds.shape, sds.dtype)
-      elif jnp.issubdtype(sds.dtype, jnp.integer):
-        return jnp.zeros(sds.shape, sds.dtype)
-      else:
-        raise ValueError(f"Unsupported dtype {sds.dtype}")
+  def _fn():
+    if jnp.issubdtype(dtype, jnp.floating):
+      return random.normal(random.key(0), shape, dtype)
+    elif jnp.issubdtype(dtype, jnp.integer) or jnp.issubdtype(dtype, jnp.bool_):
+      return jnp.zeros(shape, dtype)
     else:
-      return sds
+      raise ValueError(f"Unsupported dtype {dtype}")
 
-  return lambda: jax.tree.map(_fn, sds)
+  return jax.jit(_fn, out_shardings=sharding)
+
+
+def _get_random_val(x, sharding):
+  if hasattr(x, "shape") and hasattr(x, "dtype") and not isinstance(x, (str, int, float, bool)):
+    return _get_random_value(tuple(x.shape), x.dtype, sharding)()
+  return x
 
 
 def _try_hash_input(args, kws, must_be_concrete: bool = True):
@@ -330,13 +333,19 @@ def to_df(timing_results: dict[int, TimingResult] | Callable):
   return pd.DataFrame(data, index=index, columns=columns[1:])
 
 
+def _prefix_broadcast(sharding_tree, arg_tree, arg_name="arguments"):
+  try:
+    return jax.tree.map(lambda s, x: jax.tree.map(lambda _: s, x), sharding_tree, arg_tree)
+  except ValueError as e:
+    raise ValueError(f"Could not broadcast shardings for {arg_name}: {e}")
+
+
 def tune(
   fn_to_tune: Callable[..., Any],
   hyperparams: dict[Any, Any] | None = None,
   max_workers: int = 32,
   in_shardings: Any = UNSPECIFIED,
   out_shardings: Any = UNSPECIFIED,
-  device: jax.Device | _UnspecifiedT = UNSPECIFIED,
   example_args: tuple[Any] | None = None,
   example_kws: dict[Any, Any] | None = None,
   sample_num: int = 2**63 - 1,
@@ -350,7 +359,6 @@ def tune(
       max_workers (int, optional): Max workers for parallel compilation.
       in_shardings (Any, optional): in_shardings for timing (see jax.jit).
       out_shardings (Any, optional): out_shardings for timing (see jax.jit).
-      device (jax.Device | _UnspecifiedT, optional): device to tune on if shardings are unspecified.
       example_args (tuple[Any] | None, optional): Exact example_args to tune with, on correct device.
       example_kws (dict[Any, Any] | None, optional): Exact example_kws to tune with, on correct device.
       sample_num (int | float): Number of samples used for tuning. Defaults to full cartesian product (all samples).
@@ -371,23 +379,22 @@ def tune(
     elif example_args is not None:
       logger.debug("Example arguments provided")
       args_val = example_args
-      if in_shardings is not UNSPECIFIED or device is not UNSPECIFIED:
-        raise ValueError(
-          "`example_args` can't be used with in_shardings or device. `example_args` should be correctly sharded."
-        )
+      if in_shardings is not UNSPECIFIED:
+        raise ValueError("`example_args` can't be used with in_shardings. `example_args` should be correctly sharded.")
     else:
       logger.debug("Selecting random input arguments.")
 
       if in_shardings is not UNSPECIFIED:
         shardings = in_shardings
-        shardings = jax.tree.map(lambda s, x: jax.tree.map(lambda _: s, x), shardings, args)  # prefix-broadcast
+        shardings = _prefix_broadcast(shardings, args, arg_name="args")
       else:
-        if local_mesh is not None and any(at == jax.sharding.AxisType.Explicit for at in local_mesh.axis_types):
-          shardings = jax.tree.map(lambda x: jax.typeof(x).sharding, args)
+        if local_mesh is not None:
+          get_sharding = lambda x: jax.typeof(x).sharding if isinstance(x, (jax.Array, np.ndarray)) else None
+          shardings = jax.tree.map(get_sharding, args)
         else:
           shardings = jax.tree.map(lambda _: None, args)
       shardings = jax.tree.map(_normalize_sharding, tuple(args), tuple(shardings))
-      args_val = jax.jit(_get_random_value_fn(jax.tree.map(_maybe_aval, args)), out_shardings=shardings)()
+      args_val = jax.tree.map(_get_random_val, args, shardings)
 
     if len(kws) == 0 or all(v is None or jax.core.is_concrete(v) for v in kws.values()):
       logger.debug("All keyword arguments are concrete, no need to pick random values.")
@@ -397,7 +404,13 @@ def tune(
       kws_val = example_kws
     else:
       logger.debug("Selecting random keyword arguments.")
-      kws_val = jax.jit(_get_random_value_fn(jax.tree.map(_maybe_aval, kws)), out_shardings=shardings)()
+      if local_mesh is not None:
+        get_sharding = lambda x: jax.typeof(x).sharding if isinstance(x, (jax.Array, np.ndarray)) else None
+        shardings_kws = jax.tree.map(get_sharding, kws)
+      else:
+        shardings_kws = jax.tree.map(lambda _: None, kws)
+      shardings_kws = jax.tree.map(_normalize_sharding, kws, shardings_kws)
+      kws_val = jax.tree.map(_get_random_val, kws, shardings_kws)
 
     hyperparams_norm = {k: (v if isinstance(v, (tuple, list)) else (v,)) for k, v in hyperparams_.items()}
     executor = ThreadPoolExecutor(max_workers=max_workers)

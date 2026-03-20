@@ -93,6 +93,25 @@ class InterfaceTest(parameterized.TestCase):
     y = compute_fn(X)
     self.assertNotEmpty(fn.timing_results)
 
+  def test_kws_tracers(self):
+    @partial(tune_jax.tune, hyperparams=dict(splits=[1, 2]))
+    def fn(A, *, B, splits):
+      A_, B_ = jnp.split(A, splits, axis=1), jnp.split(B, splits, axis=0)
+      acc = 0
+      for i in range(splits):
+        acc += A_[i] @ B_[i]
+      return acc
+
+    @jax.jit
+    def compute_fn(X):
+      return X + fn(X, B=X)
+
+    X = jnp.arange(16 * 16).astype(jnp.float32).reshape((16, 16))
+
+    self.assertEmpty(fn.timing_results)
+    y = compute_fn(X)
+    self.assertNotEmpty(fn.timing_results)
+
 
 if __name__ == "__main__":
   absltest.main()
