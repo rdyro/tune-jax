@@ -118,7 +118,7 @@ def _sum_events(events):
 
 def get_events_from_plane(
   p, plane_idx, prefix_filter: str = "", event_filter_regex: str | None = None
-) -> dict[str, list[float]]:
+) -> dict[str, float]:
   """Returns a dict of xla module names (for unique inputs) to a list of their execution time in seconds."""
 
   planes = list(p.planes)

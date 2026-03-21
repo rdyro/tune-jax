@@ -6,11 +6,6 @@ from jax.sharding import PartitionSpec as P, NamedSharding, AxisType
 from absl.testing import absltest, parameterized
 import tune_jax
 
-try:
-  from jax import shard_map
-except ImportError:
-  from jax.experimental.shard_map import shard_map
-
 tune_jax.logger.setLevel("DEBUG")
 
 
@@ -105,7 +100,7 @@ class MeshTuningTest(parameterized.TestCase):
     def outer_fn(x, mesh):
       @partial(tune_jax.tune, hyperparams={"h": [1, 2]})
       def fn(x, h):
-        @partial(shard_map, mesh=mesh, in_specs=P("x", None), out_specs=P("x", None))
+        @partial(jax.shard_map, mesh=mesh, in_specs=P("x", None), out_specs=P("x", None))
         def sharded_tuning(x_local):
           return inner_fn(x_local, h)
         return sharded_tuning(x)

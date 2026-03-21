@@ -23,7 +23,6 @@ import jax
 import jax.core
 from jax import numpy as jnp
 from jax import random
-from jax.interpreters import pxla
 from jax.sharding import PartitionSpec, Sharding
 import numpy as np
 from tqdm import tqdm
@@ -90,28 +89,8 @@ class _UnspecifiedT:
 UNSPECIFIED = _UnspecifiedT()
 
 
-def _get_local_mesh():
-  if hasattr(jax.sharding, "get_mesh"):
-    mesh = jax.sharding.get_mesh()
-    return None if mesh.empty else mesh
-
-  # pytype: disable=import-error
-  from jax._src import config
-  # pytype: enable=import-error
-
-  mesh = None
-  if hasattr(getattr(config, "device_context", None), "get_local"):
-    mesh = config.device_context.get_local()
-  return mesh if isinstance(mesh, jax.sharding.Mesh) else None
-
-
-def _get_global_mesh():
-  if hasattr(jax.sharding, "get_mesh"):
-    mesh = jax.sharding.get_mesh()
-    return None if mesh.empty else mesh
-
-  env = pxla.thread_resources.env
-  mesh = env.physical_mesh
+def _get_mesh():
+  mesh = jax.sharding.get_mesh()
   return None if mesh.empty else mesh
 
 
@@ -210,7 +189,7 @@ def _normalize_sharding(
     return None
   if isinstance(sharding_or_spec, Sharding):
     return sharding_or_spec
-  global_mesh = _get_global_mesh()
+  global_mesh = _get_mesh()
   if isinstance(sharding_or_spec, PartitionSpec) and global_mesh is not None:
     return jax.NamedSharding(global_mesh, sharding_or_spec)
   elif isinstance(sharding_or_spec, PartitionSpec) and global_mesh is None:
@@ -221,7 +200,7 @@ def _normalize_sharding(
 
 def _time_with_profiler(
   _timing_closure: Callable[[], None], platform: str, total_calls_number: int, event_filter_regex: str | None = None
-) -> dict[int, tuple[float, float]]:
+) -> defaultdict[int, tuple[float, float]]:
   now = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
   profile_path = Path(tempfile.mkdtemp(prefix=f"tuning_profile_{now}_")).absolute()
   pbar = tqdm(
@@ -244,9 +223,9 @@ def _time_with_profiler(
     )
     fn_format = f"jit_{TUNE_FN_PREFIX_FMT.format('([0-9]+)')}.*"
     for k, duration in profile_events.items():
-      if not re.match(fn_format, k):
+      if (m := re.match(fn_format, k)) is None:
         continue
-      key = int(re.match(fn_format, k)[1])
+      key = int(m[1])
       if (not CONFIG._reject_zero_time_events) or duration > 0:
         function_timings[key].append(duration)
     profile_path = Path(tempfile.mkdtemp(prefix=f"tuning_profile_{now}_")).absolute()  # new path for the next iteration
@@ -371,8 +350,7 @@ def tune(
     """Main tuning method."""
 
     # resolve sharding and/or device placement #################################
-    local_mesh = _get_local_mesh()  # temporary support for jax.sharding.set_mesh, TODO: revisit
-    _maybe_aval = lambda x: x if not isinstance(x, jax.Array) else jax.typeof(x)
+    local_mesh = _get_mesh()
     if len(args) == 0 or all(x is None or jax.core.is_concrete(x) for x in jax.tree.leaves(args)):
       logger.debug("All arguments are concrete, no need to pick random values.")
       args_val = args

@@ -2,11 +2,12 @@ import functools
 from functools import partial
 import os
 
+from absl.testing import absltest
 import jax
 from jax import numpy as jnp
 from jax import random
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
-from absl.testing import absltest
+from jax.experimental.layout import Format, Layout
 
 import tune_jax
 
@@ -27,8 +28,6 @@ def platforms_available(*platforms):
 
 class SplashCasesTest(absltest.TestCase):
   def test_tune_splash(self):
-    from jax.experimental.layout import Format, Layout
-
     if not TEST_WITH_PALLAS:
       self.skipTest(f"Skipping pallas kernels since {TEST_WITH_PALLAS=}")
 
@@ -42,7 +41,6 @@ class SplashCasesTest(absltest.TestCase):
     tune_jax.CONFIG.find_optimal_layouts_automatically = False
     try:
       tune_jax.CONFIG.allow_fallback_timing = False
-      keys = iter(random.split(random.key(0), 1024))
 
       dtype = jnp.bfloat16
       bs = 1
@@ -53,8 +51,6 @@ class SplashCasesTest(absltest.TestCase):
       qk_head_dim = 192
       v_head_dim = 128
       assert q_heads % kv_heads == 0
-      # init_fn = lambda shape, dtype=dtype: random.normal(
-      #     next(keys), shape, dtype) / shape[-1]
       init_fn = lambda shape, dtype=dtype: jnp.ones(shape, dtype)
       q = init_fn((bs, q_heads, q_seq_len, qk_head_dim), dtype=dtype)
       k = init_fn((bs, kv_heads, kv_seq_len, qk_head_dim), dtype=dtype)
