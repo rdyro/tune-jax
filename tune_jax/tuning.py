@@ -118,7 +118,7 @@ def _try_call(
   mesh: Any | None = None,
 ) -> CompileResult:
   """Attempt to call the function and return whether it compiles and runs."""
-  with (jax.sharding.set_mesh(mesh) if mesh is not None else contextlib.nullcontext()):
+  with jax.sharding.set_mesh(mesh):
     try:
       if compile_only:
         if compute_layouts:
