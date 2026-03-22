@@ -3,7 +3,7 @@ name = "tune_jax"
 version = "0.7.2"
 authors = [{ name = "Robert Dyro" }]
 dependencies = [
-  "jax>=0.8.1",
+  "jax>=0.9.3",
   "numpy",
   "tqdm",
   "protobuf",
