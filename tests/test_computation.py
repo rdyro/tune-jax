@@ -156,7 +156,7 @@ class SimpleCasesTest(absltest.TestCase):
 
     hyperparams = {
       "block_q": [4, 8, 16, 32, 64, 128],
-      "block_k": [4, 8, 16, 32, 64, 128],
+      "block_k": [4, 8, 16, 32],  # block_k >= 64 segfaults the GPU compiler in JAX 0.9.2
     }
 
     b, qt, h, d = 8, 32, 8, 512
@@ -206,7 +206,7 @@ class SimpleCasesTest(absltest.TestCase):
 
     hyperparams = {
       "block_q": [4, 8, 16, 32, 64, 128],
-      "block_k": [4, 8, 16, 32, 64, 128],
+      "block_k": [4, 8, 16, 32],  # block_k >= 64 segfaults the GPU compiler in JAX 0.9.2
     }
 
     b, qt, h, d = 8, 32, 8, 512

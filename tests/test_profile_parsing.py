@@ -65,7 +65,7 @@ class ProfileReadingTest(absltest.TestCase):
       tune_jax.CONFIG.allow_fallback_timing = False
       hyperparams = {
         "block_q": [4, 8, 16, 32, 64, 128],
-        "block_k": [4, 8, 16, 32, 64, 128],
+        "block_k": [4, 8, 16, 32],  # block_k >= 64 segfaults the GPU compiler in JAX 0.9.2
       }
       b, qt, h, d, kt = 8, 32, 8, 512, 128
       q = random.normal(random.key(0), (b, qt, h, d), dtype=jnp.bfloat16)
