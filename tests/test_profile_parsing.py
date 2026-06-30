@@ -91,6 +91,17 @@ class ProfileReadingTest(absltest.TestCase):
     finally:
       tune_jax.CONFIG.allow_fallback_timing = True
 
+  def test_sum_events(self):
+    from tune_jax.profile_reader.parse_profile import _sum_events
+    events = [
+      {"start_ps": 0, "end_ps": 10},
+      {"start_ps": 5, "end_ps": 15},
+      {"start_ps": 15, "end_ps": 20},
+      {"start_ps": 25, "end_ps": 30},
+      {"start_ps": 25, "end_ps": 30},
+    ]
+    self.assertEqual(_sum_events(events), 25)
+
 
 if __name__ == "__main__":
   absltest.main()

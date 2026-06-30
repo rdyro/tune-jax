@@ -97,23 +97,14 @@ def _find_children(own_name: str, start_ps: int, end_ps: int, events_sorted: lis
 
 def _sum_events(events):
   """Sum the time of all events as right extreme - left extreme subtracting empty space."""
-  if len(events) == 0:
+  if not events:
     return 0
-  if len(events) == 1:
-    return events[0]["end_ps"] - events[0]["start_ps"]
   starts, ends = np.array([e["start_ps"] for e in events]), np.array([e["end_ps"] for e in events])
-  min_start, max_end = int(np.min(starts)), int(np.max(ends))
-  sorted_starts, sorted_ends = np.sort(starts), np.sort(ends)
-  # find which of the potential endpoints (sorted_ends[:-1]) do NOT fall within any event's duration
-  empty_end_indices = np.where(
-      ~np.any((sorted_ends[None, :-1] < ends[:, None]) & (sorted_ends[None, :-1] >= starts[:, None]), axis=0)
-  )[0]
-  gap_start_values = sorted_ends[empty_end_indices]
-  next_start_indices = np.searchsorted(sorted_starts, gap_start_values)  # starts of the next event block for each gap
-  gap_end_values = sorted_starts[next_start_indices]
-  empty_space = np.sum(gap_end_values - gap_start_values)
-  assert empty_space < (max_end - min_start)
-  return int(max_end - min_start - empty_space)
+  times = np.concatenate([starts, ends])
+  counts = np.concatenate([np.ones_like(starts), -np.ones_like(ends)])
+  order = np.argsort(times)
+  active = np.cumsum(counts[order])
+  return int(np.sum(np.diff(times[order]) * (active[:-1] > 0)))
 
 
 def get_events_from_plane(

@@ -1,3 +1,5 @@
+scratch/**
+data/**
 **/*.whl
 .vscode/*
 
