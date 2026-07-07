@@ -17,7 +17,9 @@ class MeshTuningTest(parameterized.TestCase):
 
     @jax.jit
     def tuned_fn(x):
-      def inner(x, h): return x * h
+      def inner(x, h):
+        return x * h
+
       tuned_inner = tune_jax.tune(inner, hyperparams={"h": [1, 2]})
       ret = tuned_inner(x)
       print(tune_jax.tabulate(tuned_inner.timing_results))
@@ -34,7 +36,8 @@ class MeshTuningTest(parameterized.TestCase):
     mesh = jax.make_mesh((len(devices),), ("x",), axis_types=(axis_type,))
     sharding = NamedSharding(mesh, P("x", None))
 
-    def fn(x, h): return x + h
+    def fn(x, h):
+      return x + h
 
     @jax.jit
     def outer_fn(x):
@@ -53,7 +56,8 @@ class MeshTuningTest(parameterized.TestCase):
     mesh = jax.make_mesh((len(devices),), ("x",), axis_types=(axis_type,))
     sharding = NamedSharding(mesh, P("x", None))
 
-    def fn(x, h): return x + h
+    def fn(x, h):
+      return x + h
 
     with jax.sharding.set_mesh(mesh):
       x_aval = jax.ShapeDtypeStruct((8, 8), jnp.float32)
@@ -77,7 +81,9 @@ class MeshTuningTest(parameterized.TestCase):
 
     @jax.jit
     def tuned_fn(x):
-      def inner(x, h): return x * h
+      def inner(x, h):
+        return x * h
+
       return tune_jax.tune(inner, hyperparams={"h": [1, 2]})(x)
 
     with jax.sharding.set_mesh(mesh):
@@ -103,6 +109,7 @@ class MeshTuningTest(parameterized.TestCase):
         @partial(jax.shard_map, mesh=mesh, in_specs=P("x", None), out_specs=P("x", None))
         def sharded_tuning(x_local):
           return inner_fn(x_local, h)
+
         return sharded_tuning(x)
 
       return fn(x)

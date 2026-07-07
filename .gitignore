@@ -1,5 +1,9 @@
 scratch/**
 data/**
+experiments.ipynb
+analyze_profiles.ipynb
+sandbox/*
+dumps/*
 **/*.whl
 .vscode/*
 

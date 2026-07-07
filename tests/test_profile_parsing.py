@@ -34,18 +34,10 @@ def _cond_fn(c, fn1, fn2, *args):
   return jax.lax.cond(c, lambda: fn1(*args), lambda: fn2(*args))
 
 
-def _gpu_attention(q, k, v, block_q, block_k):
+def _tpu_matmul(x, y, block_m, block_n, block_k):
+  from tests import tpu_matmul
 
-  from jax.experimental.pallas.ops.gpu import attention as attention_gpu
-
-  if hasattr(attention_gpu, "BlockSizes"):
-    attention_fn = lambda *args, block_q=None, block_k=None, **kw: attention_gpu.mha(
-      *args,
-      **dict(kw, block_sizes=attention_gpu.BlockSizes(block_q=block_q, block_k=block_k)),
-    )
-  else:
-    attention_fn = attention_gpu.mha
-  return attention_fn(q, k, v, segment_ids=None, block_q=block_q, block_k=block_k)
+  return tpu_matmul.matmul(x, y, block_shape=(block_m, block_n), block_k=block_k)
 
 
 def _long_while(it, x, y):
@@ -56,25 +48,27 @@ def _long_while(it, x, y):
 
 
 class ProfileReadingTest(absltest.TestCase):
-  def test_parsing_multiple_profiles_on_gpu(self):
+  def test_parsing_multiple_profiles(self):
     if not TEST_WITH_PALLAS:
       self.skipTest(f"Skipping pallas kernels since {TEST_WITH_PALLAS=}")
-    if not platforms_available("gpu", "tpu"):
-      self.skipTest("No GPU or TPU available")
+
+    if platforms_available("tpu"):
+      try:
+        tune_jax.CONFIG.allow_fallback_timing = False
+        hyperparams = {
+          "block_m": [256, 512],
+          "block_n": [256, 512],
+          "block_k": [256, 512],
+        }
+        x = random.normal(random.key(0), (1024, 1024), dtype=jnp.bfloat16)
+        y = random.normal(random.key(1), (1024, 1024), dtype=jnp.bfloat16)
+        tune_jax.tune(_tpu_matmul, hyperparams=hyperparams)(x, y).block_until_ready()
+        jax.jit(tune_jax.tune(_tpu_matmul, hyperparams=hyperparams))(x, y).block_until_ready()
+      finally:
+        tune_jax.CONFIG.allow_fallback_timing = True
+
     try:
       tune_jax.CONFIG.allow_fallback_timing = False
-      hyperparams = {
-        "block_q": [4, 8, 16, 32, 64, 128],
-        "block_k": [4, 8, 16, 32],  # block_k >= 64 segfaults the GPU compiler in JAX 0.9.2
-      }
-      b, qt, h, d, kt = 8, 32, 8, 512, 128
-      q = random.normal(random.key(0), (b, qt, h, d), dtype=jnp.bfloat16)
-      k = random.normal(random.key(1), (b, kt, h, d), dtype=jnp.bfloat16)
-      v = random.normal(random.key(2), (b, kt, h, d), dtype=jnp.bfloat16)
-      if platforms_available("gpu"):
-        tune_jax.tune(_gpu_attention, hyperparams=hyperparams)(q, k, v).block_until_ready()
-        jax.jit(tune_jax.tune(_gpu_attention, hyperparams=hyperparams))(q, k, v).block_until_ready()
-
       x = random.normal(random.key(0), (1024, 1024), dtype=jnp.bfloat16)
       y = random.normal(random.key(1), (1024, 1024), dtype=jnp.bfloat16)
 
@@ -93,6 +87,7 @@ class ProfileReadingTest(absltest.TestCase):
 
   def test_sum_events(self):
     from tune_jax.profile_reader.parse_profile import _sum_events
+
     events = [
       {"start_ps": 0, "end_ps": 10},
       {"start_ps": 5, "end_ps": 15},

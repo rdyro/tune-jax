@@ -1,4 +1,3 @@
-import functools
 from functools import partial
 import os
 
@@ -6,7 +5,7 @@ from absl.testing import absltest
 import jax
 from jax import numpy as jnp
 from jax import random
-from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
+from jax.sharding import PartitionSpec as P
 from jax.experimental.layout import Format, Layout
 
 import tune_jax
@@ -146,46 +145,34 @@ class SimpleCasesTest(absltest.TestCase):
     C = tuned_mha_jit().block_until_ready()
     assert C.shape[-1] == min(hyperparams["n"])
 
-  def test_simple_mha(self):
+  def test_simple_tpu_matmul(self):
     if not TEST_WITH_PALLAS:
       self.skipTest(f"Skipping pallas kernels since {TEST_WITH_PALLAS=}")
-    if not platforms_available("gpu"):
-      self.skipTest("No GPU available")
+    if not platforms_available("tpu"):
+      self.skipTest("No TPU available")
 
-    from jax.experimental.pallas.ops.gpu import attention
+    from tests import tpu_matmul
 
     hyperparams = {
-      "block_q": [4, 8, 16, 32, 64, 128],
-      "block_k": [4, 8, 16, 32],  # block_k >= 64 segfaults the GPU compiler in JAX 0.9.2
+      "block_m": [256, 512],
+      "block_n": [256, 512],
+      "block_k": [256, 512],
     }
 
-    b, qt, h, d = 8, 32, 8, 512
-    kt = 128
+    x = random.normal(random.key(0), (1024, 1024), dtype=jnp.bfloat16)
+    y = random.normal(random.key(1), (1024, 1024), dtype=jnp.bfloat16)
 
-    q = random.normal(random.key(0), (b, qt, h, d), dtype=jnp.bfloat16)
-    k = random.normal(random.key(0), (b, kt, h, d), dtype=jnp.bfloat16)
-    v = random.normal(random.key(0), (b, kt, h, d), dtype=jnp.bfloat16)
+    def matmul_fn(x, y, *, block_m=128, block_n=128, block_k=128):
+      return tpu_matmul.matmul(x, y, block_shape=(block_m, block_n), block_k=block_k)
 
-    if hasattr(attention, "BlockSizes"):
-      attention_wrapper = lambda *args, block_q=None, block_k=None, **kw: attention.mha(
-        *args,
-        **dict(kw, block_sizes=attention.BlockSizes(block_q=block_q, block_k=block_k)),
-      )
-      attention_fn = attention_wrapper
-    else:  # jax < 0.5.2
-      attention_fn = attention.mha
-    tuned_mha = tune_jax.tune(jax.jit(attention_fn, static_argnames=("block_q", "block_k")), hyperparams=hyperparams)
-    tuned_mha_jit = jax.jit(tuned_mha)
+    tuned_matmul = tune_jax.tune(
+      jax.jit(matmul_fn, static_argnames=("block_m", "block_n", "block_k")),
+      hyperparams=hyperparams,
+    )
+    tuned_matmul_jit = jax.jit(tuned_matmul)
 
-    tuned_mha_jit(q, k, v, segment_ids=None).block_until_ready()
-    tuned_mha_jit(q, k, v, segment_ids=None).block_until_ready()
-    q = random.normal(random.key(0), (2 * b, qt, h, d), dtype=jnp.bfloat16)
-    k = random.normal(random.key(0), (2 * b, kt, h, d), dtype=jnp.bfloat16)
-    v = random.normal(random.key(0), (2 * b, kt, h, d), dtype=jnp.bfloat16)
-    tuned_mha_jit(q, k, v, segment_ids=None).block_until_ready()
-    tuned_mha_jit(q, k, v, segment_ids=None).block_until_ready()
-
-    print(tuned_mha_jit.timing_results)  # to get access to latest timing results
+    tuned_matmul_jit(x, y).block_until_ready()
+    print(tuned_matmul_jit.timing_results)
 
   def test_default_device_resolution(self):
     out = jax.jit(tune_jax.tune(lambda x: x))(1)
@@ -196,57 +183,41 @@ class SimpleCasesTest(absltest.TestCase):
       out = jax.jit(tune_jax.tune(lambda x: x))(1)
       self.assertEqual(list(out.devices())[0].platform.lower(), "cpu")
 
-  def test_multidevice(self):
+  def test_multidevice_tpu_matmul(self):
     if not TEST_WITH_PALLAS:
       self.skipTest(f"Skipping pallas kernels since {TEST_WITH_PALLAS=}")
-    if not platforms_available("gpu"):
-      self.skipTest("No GPU available")
-
-    from jax.experimental.pallas.ops.gpu import attention
-
-    hyperparams = {
-      "block_q": [4, 8, 16, 32, 64, 128],
-      "block_k": [4, 8, 16, 32],  # block_k >= 64 segfaults the GPU compiler in JAX 0.9.2
-    }
-
-    b, qt, h, d = 8, 32, 8, 512
-    kt = 128
+    if not platforms_available("tpu"):
+      self.skipTest("No TPU available")
 
     if len(jax.devices()) < 2:
       return
 
-    mesh = Mesh(devices=jax.devices(), axis_names=("x",))
+    from tests import tpu_matmul
 
-    q = random.normal(random.key(0), (b, qt, h, d), dtype=jnp.bfloat16)
-    k = random.normal(random.key(0), (b, kt, h, d), dtype=jnp.bfloat16)
-    v = random.normal(random.key(0), (b, kt, h, d), dtype=jnp.bfloat16)
+    hyperparams = {
+      "block_m": [256, 512],
+      "block_n": [256, 512],
+      "block_k": [256, 512],
+    }
 
-    in_shardings = [NamedSharding(mesh, P(*(["x"] + [None] * (z.ndim - 1)))) for z in [q, k, v]]
-    q, k, v = jax.tree.map(lambda x, y: jax.device_put(x, y), [q, k, v], in_shardings)
+    mesh = jax.make_mesh((jax.device_count(),), ("x",))
 
-    if hasattr(attention, "BlockSizes"):
-      attention_wrapper = lambda *args, block_q=None, block_k=None, **kw: attention.mha(
-        *args,
-        **dict(kw, block_sizes=attention.BlockSizes(block_q=block_q, block_k=block_k)),
+    with jax.set_mesh(mesh):
+      x = random.normal(random.key(1), (1024, 1024), dtype=jnp.bfloat16, out_sharding=P(None, "x"))
+      y = random.normal(random.key(2), (1024, 1024), dtype=jnp.bfloat16, out_sharding=P("x", None))
+
+    with jax.set_mesh(mesh):
+      def matmul_fn(x, y, *, block_m=128, block_n=128, block_k=128):
+        def inner(x, y):
+          out = tpu_matmul.matmul(x, y, block_shape=(block_m, block_n), block_k=block_k)
+          return jax.lax.psum(out, axis_name="x")
+        return jax.shard_map(inner, out_specs=P(), check_vma=False)(x, y)
+      tuned_matmul = tune_jax.tune(
+        matmul_fn, hyperparams=hyperparams, example_args=(x, y),
       )
-      tuned_mha = tune_jax.tune(
-        functools.partial(attention_wrapper, segment_ids=None), hyperparams=hyperparams, in_shardings=in_shardings
-      )
-    else:  # jax < 0.5.2
-      tuned_mha = tune_jax.tune(
-        functools.partial(attention.mha, segment_ids=None), hyperparams=hyperparams, in_shardings=in_shardings
-      )
-    tuned_mha_jit = jax.jit(tuned_mha, in_shardings=in_shardings)  # type: ignore
-
-    tuned_mha_jit(q, k, v).block_until_ready()
-    tuned_mha_jit(q, k, v).block_until_ready()
-    q = random.normal(random.key(0), (2 * b, qt, h, d), dtype=jnp.bfloat16)
-    k = random.normal(random.key(0), (2 * b, kt, h, d), dtype=jnp.bfloat16)
-    v = random.normal(random.key(0), (2 * b, kt, h, d), dtype=jnp.bfloat16)
-    tuned_mha_jit(q, k, v).block_until_ready()
-    tuned_mha_jit(q, k, v).block_until_ready()
-
-    print(tuned_mha_jit.timing_results)  # to get access to latest timing results
+      tuned_matmul_jit = jax.jit(tuned_matmul)
+      tuned_matmul_jit(x, y).block_until_ready()
+    print(tuned_matmul_jit.timing_results)
 
 
 if __name__ == "__main__":

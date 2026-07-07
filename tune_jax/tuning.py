@@ -1,6 +1,5 @@
-from __future__ import annotations
-
 import os
+
 import traceback
 import itertools
 import contextlib
@@ -259,11 +258,20 @@ def _get_random_val(x, sharding):
   return x
 
 
+def _is_concrete(x):
+  try:
+    if isinstance(x, jax.core.Tracer):
+      return x.to_concrete_value() is not None
+    return x is not None
+  except:  # noqa: E722
+    return jax.core.is_concrete(x)
+
+
 def _try_hash_input(args, kws, must_be_concrete: bool = True):
   """For eager mode tunable, hash the shape, dtype and sharding of the inputs."""
 
   flat_vals, struct = jax.tree.flatten((args, kws))
-  all_concrete = all(jax.core.is_concrete(x) for x in flat_vals if isinstance(x, jax.Array))
+  all_concrete = all(_is_concrete(x) for x in flat_vals if isinstance(x, jax.Array))
   if not all_concrete and must_be_concrete:
     return None
 
@@ -351,7 +359,7 @@ def tune(
 
     # resolve sharding and/or device placement #################################
     local_mesh = _get_mesh()
-    if len(args) == 0 or all(x is None or jax.core.is_concrete(x) for x in jax.tree.leaves(args)):
+    if len(args) == 0 or all(x is None or _is_concrete(x) for x in jax.tree.leaves(args)):
       logger.debug("All arguments are concrete, no need to pick random values.")
       args_val = args
     elif example_args is not None:
@@ -374,10 +382,11 @@ def tune(
       shardings = jax.tree.map(_normalize_sharding, tuple(args), tuple(shardings))
       args_val = jax.tree.map(_get_random_val, args, shardings)
 
-    if len(kws) == 0 or all(v is None or jax.core.is_concrete(v) for v in kws.values()):
+    if len(kws) == 0 or all(v is None or _is_concrete(v) for v in kws.values()):
       logger.debug("All keyword arguments are concrete, no need to pick random values.")
       kws_val = kws
     elif example_kws is not None:
+
       logger.debug("Example keyword arguments provided")
       kws_val = example_kws
     else:
@@ -524,41 +533,43 @@ def tune(
 
 
 def test_main():
-  from jax.experimental.pallas.ops.gpu import attention
+  try:
+    jax.devices("tpu")
+  except:  # noqa: E722
+    print("TPU not available, skipping Pallas TPU test in test_main.")
+    return
+
+  from tests import tpu_matmul
 
   hyperparams = {
-    "block_q": [4, 8, 16, 32, 64, 128],
-    "block_k": [4, 8, 16, 32, 64, 128],
-    "segment_ids": None,  # scalars are ok
+    "block_m": [128, 256],
+    "block_n": [128, 256],
+    "block_k": [128, 256],
   }
 
-  b, qt, h, d = 8, 32, 8, 512
-  kt = 128
+  x = random.normal(random.key(0), (1024, 1024), dtype=jnp.bfloat16)
+  y = random.normal(random.key(1), (1024, 1024), dtype=jnp.bfloat16)
 
-  q = random.normal(random.key(0), (b, qt, h, d), dtype=jnp.bfloat16)
-  k = random.normal(random.key(0), (b, kt, h, d), dtype=jnp.bfloat16)
-  v = random.normal(random.key(0), (b, kt, h, d), dtype=jnp.bfloat16)
+  def matmul_fn(x, y, *, block_m=128, block_n=128, block_k=128):
+    return tpu_matmul.matmul(x, y, block_shape=(block_m, block_n), block_k=block_k)
 
-  attention_wrapper = lambda *args, block_q, block_k, **kw: attention.mha(
-    *args,
-    **dict(kw, block_sizes=attention.BlockSizes(block_q=block_q, block_k=block_k)),
+  tuned_matmul = tune(
+    jax.jit(matmul_fn, static_argnames=("block_m", "block_n", "block_k")),
+    hyperparams=hyperparams,
+    sample_num=5,
   )
-
-  tuned_mha = tune(attention_wrapper, hyperparams=hyperparams, sample_num=5)
-  tuned_mha_jit = jax.jit(tuned_mha)
+  tuned_matmul_jit = jax.jit(tuned_matmul)
 
   logger.setLevel("DEBUG")
 
-  tuned_mha_jit(q, k, v).block_until_ready()
-  tuned_mha_jit(q, k, v).block_until_ready()
-  q = random.normal(random.key(0), (2 * b, qt, h, d), dtype=jnp.bfloat16)
-  k = random.normal(random.key(0), (2 * b, kt, h, d), dtype=jnp.bfloat16)
-  v = random.normal(random.key(0), (2 * b, kt, h, d), dtype=jnp.bfloat16)
-  tuned_mha_jit(q, k, v).block_until_ready()
-  tuned_mha_jit(q, k, v).block_until_ready()
+  tuned_matmul_jit(x, y).block_until_ready()
+  tuned_matmul_jit(x, y).block_until_ready()
+  x = random.normal(random.key(0), (1024, 1024), dtype=jnp.bfloat16)
+  y = random.normal(random.key(1), (1024, 1024), dtype=jnp.bfloat16)
+  tuned_matmul_jit(x, y).block_until_ready()
+  tuned_matmul_jit(x, y).block_until_ready()
 
-  print(tuned_mha_jit.timing_results)  # to get access to timing results
-
+  print(tuned_matmul_jit.timing_results)
   return
 
 
