@@ -99,6 +99,12 @@ def _get_default_device():
   return jax.devices()[0]
 
 
+def _is_concrete(x):
+  if hasattr(jax.core, "is_concrete"):
+    return jax.core.is_concrete(x)
+  return isinstance(x, jax.core.Tracer)
+
+
 @contextlib.contextmanager
 def suppress_stdout_stderr():
   devnull, stdout, stderr = open(os.devnull, "w+"), os.dup(1), os.dup(2)

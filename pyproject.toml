@@ -1,6 +1,6 @@
 [project]
 name = "tune_jax"
-version = "0.7.4"
+version = "0.7.5"
 authors = [{ name = "Robert Dyro" }]
 dependencies = [
   "jax>=0.8.1",
