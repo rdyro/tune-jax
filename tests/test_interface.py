@@ -1,4 +1,6 @@
 from functools import partial
+import os
+from pathlib import Path
 
 from absl.testing import absltest, parameterized
 import jax
@@ -89,6 +91,17 @@ class InterfaceTest(parameterized.TestCase):
     fn_tuned = tune_jax.tune(lambda x, a: x, hyperparams={"a": [1]})
     with self.assertRaisesRegex(ValueError, "the second time"):
       tune_jax.tune(fn_tuned, hyperparams={"a": [1]})
+
+  def test_suppress_stdout_stderr_restores_fds(self):
+    fd_count = lambda: len(list(Path("/proc/self/fd").iterdir()))
+    stdout_stat, fds_before = os.fstat(1), fd_count()
+    for _ in range(20):
+      with tune_jax.tuning.suppress_stdout_stderr():
+        pass
+    with self.assertRaises(ValueError), tune_jax.tuning.suppress_stdout_stderr():
+      raise ValueError
+    self.assertEqual(fd_count(), fds_before)
+    self.assertEqual(os.fstat(1).st_ino, stdout_stat.st_ino)
 
   def test_tabulate_results(self):
     def fn(x, a, b):

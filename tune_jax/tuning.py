@@ -1,5 +1,6 @@
 import os
 import shutil
+import sys
 import traceback
 import itertools
 import contextlib
@@ -112,12 +113,20 @@ def _is_concrete(x):
     return jax.core.is_concrete(x) if hasattr(jax.core, "is_concrete") else False
 
 
+_stdout_stderr_lock = threading.RLock()
+
+
 @contextlib.contextmanager
 def suppress_stdout_stderr():
-  devnull, stdout, stderr = open(os.devnull, "w+"), os.dup(1), os.dup(2)
-  os.dup2(devnull.fileno(), 1), os.dup2(devnull.fileno(), 2)
-  yield
-  os.dup2(stdout, 1), os.dup2(stderr, 2)
+  with _stdout_stderr_lock, open(os.devnull, "w") as devnull:
+    sys.stdout.flush(), sys.stderr.flush()
+    saved_fds = [os.dup(1), os.dup(2)]
+    try:
+      os.dup2(devnull.fileno(), 1), os.dup2(devnull.fileno(), 2)
+      yield
+    finally:
+      for fd, saved_fd in zip([1, 2], saved_fds):
+        os.dup2(saved_fd, fd), os.close(saved_fd)
 
 
 def _try_call(
