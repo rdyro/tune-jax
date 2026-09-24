@@ -1,4 +1,6 @@
+import json
 import os
+import re
 import tempfile
 from pathlib import Path
 
@@ -163,6 +165,23 @@ class ProfileReadingTest(absltest.TestCase):
           self.assertEqual(len(profile_dirs), tune_jax.CONFIG.profiling_samples if keep else 0)
     finally:
       tune_jax.CONFIG.keep_profile_files, tempfile.tempdir = keep_default, tempdir_default
+
+  def test_tpu_splash_traces(self):
+    from tune_jax.profile_reader import parse_profile
+
+    # tuning profiles captured by `tune` on a TPU v5e (jax 0.11.2) for splash attention fwd and fwd + bwd
+    data = Path(__file__).parent / "data"
+    summary = json.loads((data / "splash_summary.json").read_text())
+    for name, info in summary.items():
+      p = parse_profile.parse_profile_from_bytes((data / f"{name}.xplane.pb").read_bytes())
+      plane_ids = parse_profile.find_device_plane_ids(p, "tpu")
+      self.assertEqual([list(p.planes)[i].name for i in plane_ids], ["/device:TPU:0"])
+      events = parse_profile.get_events_from_plane(p, plane_ids[0], prefix_filter="jit_")
+      fn_times = {int(m[1]): t for k, t in events.items() if (m := re.match(r"jit_tune_jax_fn_([0-9]+)\(", k))}
+      expected = {int(i): r["t_mean"] for i, r in info["timing_results"].items()}
+      self.assertEqual(sorted(fn_times), sorted(expected))
+      for i, t_mean in expected.items():  # a single trace vs the mean over all profiling samples
+        self.assertAlmostEqual(fn_times[i] / t_mean, 1.0, delta=0.01)
 
   def test_sum_events(self):
     from tune_jax.profile_reader.parse_profile import _sum_events
