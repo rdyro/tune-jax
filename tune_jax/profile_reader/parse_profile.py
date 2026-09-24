@@ -76,18 +76,11 @@ def find_device_plane_ids(p: XSpace, device_str: str) -> list[int]:
   return [i for i, plane in enumerate(p.planes) if device_str.lower() in plane.name.lower()]
 
 
-def _find_children(own_name: str, start_ps: int, end_ps: int, events_sorted: list[dict[str, Any]]):
-  """Find all events that are fully subsumed by the `start_ps` - `end_ps` range."""
-  t0 = start_ps - EVENT_CHILD_TOLERANCE_PS - 1
-  idx = np.searchsorted(np.sort(np.array([event["start_ps"] for event in events_sorted])), t0)
-  children = []
-  while idx < len(events_sorted) and events_sorted[idx]["start_ps"] <= end_ps + EVENT_CHILD_TOLERANCE_PS:
-    ts, te = events_sorted[idx]["start_ps"], events_sorted[idx]["end_ps"]
-    is_contained = ts >= start_ps - EVENT_CHILD_TOLERANCE_PS and te <= end_ps + EVENT_CHILD_TOLERANCE_PS
-    if is_contained and events_sorted[idx]["unified_name"] != own_name:
-      children.append(events_sorted[idx])
-    idx += 1
-  return children
+def _find_children(own_name: str, start_ps: int, end_ps: int, events_sorted: list[dict[str, Any]], starts: np.ndarray):
+  """Find all events that are fully subsumed by the `start_ps` - `end_ps` range, `starts` are sorted event starts."""
+  t0, t1 = start_ps - EVENT_CHILD_TOLERANCE_PS, end_ps + EVENT_CHILD_TOLERANCE_PS
+  lo, hi = np.searchsorted(starts, t0, side="left"), np.searchsorted(starts, t1, side="right")
+  return [e for e in events_sorted[lo:hi] if e["end_ps"] <= t1 and e["unified_name"] != own_name]
 
 
 def _sum_events(events):
@@ -149,10 +142,10 @@ def get_events_from_plane(
           event["unified_name"] = f"CHILD-{event['unified_name']}"
     sorted_events = sorted(sorted_events, key=lambda x: x["start_ps"])  # resort events since we append parents now
 
-  filtered_events = []
+  filtered_events, starts = [], np.array([event["start_ps"] for event in sorted_events])
   for event in sorted_events:
     if event["unified_name"].startswith(prefix_filter):
-      event["children"] = _find_children(event["unified_name"], event["start_ps"], event["end_ps"], sorted_events)
+      event["children"] = _find_children(event["unified_name"], event["start_ps"], event["end_ps"], sorted_events, starts)
       if event_filter_regex is not None:
         # an alternative timing method, look for children based on the regex pattern
         # and sum all children events times subtracting empty space: len(|---|    |-||--|) = 6
