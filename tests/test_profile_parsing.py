@@ -1,4 +1,6 @@
 import os
+import tempfile
+from pathlib import Path
 
 import jax
 from jax import numpy as jnp
@@ -84,6 +86,50 @@ class ProfileReadingTest(absltest.TestCase):
       jax.jit(tune_jax.tune(_fn, hyperparams={"it": [0, 1, 2, 3, 4, 5, 6, 7]}))(x, y)
     finally:
       tune_jax.CONFIG.allow_fallback_timing = True
+
+  def test_parse_paths_agree(self):
+    from tune_jax.profile_reader import parse_profile, xplane_pb2
+
+    xs = xplane_pb2.XSpace()
+    plane = xs.planes.add(name="/device:GPU:0")
+    plane.event_metadata[1].name = "kernel"
+    names = {1: "hlo_module", 2: "program_id", 3: "unified_name", 4: "zero_stat", 5: "jit_tune_jax_fn_0"}
+    for i, name in names.items():
+      plane.stat_metadata[i].name = name
+    for timestamp_ns in [1000, 2000]:  # two lines with different base timestamps
+      event = plane.lines.add(name=f"Stream #{timestamp_ns}", timestamp_ns=timestamp_ns).events.add(
+        metadata_id=1, offset_ps=0, duration_ps=500_000
+      )
+      event.stats.add(metadata_id=1, ref_value=5)
+      event.stats.add(metadata_id=2, int64_value=7)
+      event.stats.add(metadata_id=3, str_value="colliding stat name")
+      event.stats.add(metadata_id=4, int64_value=0)
+      event.stats.add(metadata_id=99, int64_value=1)  # unresolvable stat metadata
+    profile_bytes = xs.SerializeToString()
+
+    parsers = [parse_profile._parse_xspace_proto, parse_profile.parse_profile_from_bytes]
+    for parse in parsers:
+      p = parse(profile_bytes)
+      plane_idx = parse_profile.find_device_plane_ids(p, "gpu")[0]
+      events = parse_profile.get_events_from_plane(p, plane_idx, prefix_filter="jit_")
+      self.assertEqual(list(events.keys()), ["jit_tune_jax_fn_0(7)"])
+      self.assertAlmostEqual(events["jit_tune_jax_fn_0(7)"], 1.5e-6)
+    stats = parse_profile._parse_stats(xs.planes[0].lines[0].events[0].stats, xs.planes[0].stat_metadata)
+    self.assertEqual(stats["zero_stat"], 0)
+
+  def test_profile_files_cleanup(self):
+    fn = lambda x, y, dummy: x @ y
+    x = jnp.ones((128, 128))
+    keep_default, tempdir_default = tune_jax.CONFIG.keep_profile_files, tempfile.tempdir
+    try:
+      for keep in [False, True]:
+        with tempfile.TemporaryDirectory(dir=tempdir_default) as root:
+          tune_jax.CONFIG.keep_profile_files, tempfile.tempdir = keep, root
+          tune_jax.tune(fn, hyperparams={"dummy": [1, 2]})(x, x)
+          profile_dirs = list(Path(root).glob("tuning_profile_*"))
+          self.assertEqual(len(profile_dirs), tune_jax.CONFIG.profiling_samples if keep else 0)
+    finally:
+      tune_jax.CONFIG.keep_profile_files, tempfile.tempdir = keep_default, tempdir_default
 
   def test_sum_events(self):
     from tune_jax.profile_reader.parse_profile import _sum_events

@@ -1,5 +1,5 @@
 import os
-
+import shutil
 import traceback
 import itertools
 import contextlib
@@ -52,6 +52,8 @@ class _Config:
   find_optimal_layouts_automatically: bool = False
   # whether to wrap the tuned function in jax.jit (hyperparams static) if it isn't already jitted
   wrap_unjitted_fn_in_jit: bool = True
+  # whether to keep the profile files written during tuning (e.g., for inspection), otherwise deleted after parsing
+  keep_profile_files: bool = False
   # whether to mark events that come back as 0.0 seconds as invalid
   _reject_zero_time_events: bool = True
 
@@ -212,21 +214,24 @@ def _time_with_profiler(
   _timing_closure: Callable[[], None], platform: str, total_calls_number: int, event_filter_regex: str | None = None
 ) -> defaultdict[int, tuple[float, float]]:
   now = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-  profile_path = Path(tempfile.mkdtemp(prefix=f"tuning_profile_{now}_")).absolute()
-  pbar = tqdm(
-    range(total_calls_number), desc=f"Profiling {platform}: {profile_path}", disable=logger.level > logging.INFO
-  )
+  pbar = tqdm(range(total_calls_number), desc=f"Profiling {platform}", disable=logger.level > logging.INFO)
   function_timings = defaultdict(list)
   for _ in pbar:
-    profile_path.mkdir(exist_ok=True)
-    with suppress_stdout_stderr():
-      with jax.profiler.trace(str(profile_path)):
-        _timing_closure()
-    profile_files = sorted(profile_path.glob("**/*.xplane.pb"), key=lambda f: f.stat().st_mtime)
-    if len(profile_files) == 0:
-      raise RuntimeError("No profile was created.")
-    latest_profile = profile_files[-1]
-    profile_proto = profile_reader.parse_profile_from_bytes(latest_profile.read_bytes())
+    profile_path = Path(tempfile.mkdtemp(prefix=f"tuning_profile_{now}_")).absolute()
+    try:
+      with suppress_stdout_stderr():
+        with jax.profiler.trace(str(profile_path)):
+          _timing_closure()
+      profile_files = sorted(profile_path.glob("**/*.xplane.pb"), key=lambda f: f.stat().st_mtime)
+      if len(profile_files) == 0:
+        raise RuntimeError("No profile was created.")
+      profile_bytes = profile_files[-1].read_bytes()
+    finally:
+      if CONFIG.keep_profile_files:
+        logger.info(f"Profile kept in {profile_path}")
+      else:
+        shutil.rmtree(profile_path, ignore_errors=True)
+    profile_proto = profile_reader.parse_profile_from_bytes(profile_bytes)
     device_plane_id = profile_reader.find_device_plane_ids(profile_proto, platform)[0]
     profile_events = profile_reader.get_events_from_plane(
       profile_proto, device_plane_id, prefix_filter="jit_", event_filter_regex=event_filter_regex
@@ -238,7 +243,6 @@ def _time_with_profiler(
       key = int(m[1])
       if (not CONFIG._reject_zero_time_events) or duration > 0:
         function_timings[key].append(duration)
-    profile_path = Path(tempfile.mkdtemp(prefix=f"tuning_profile_{now}_")).absolute()  # new path for the next iteration
 
   for key, durations in function_timings.items():
     if len(durations) > 2:
