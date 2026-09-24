@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import re
 import tempfile
@@ -24,6 +25,16 @@ def platforms_available(*platforms):
     except:  # noqa: E722
       pass
   return False
+
+
+def xplane_pb2_or_none():
+  """The vendored `xplane_pb2` gencode cannot be loaded against every protobuf runtime."""
+  try:
+    from tune_jax.profile_reader import xplane_pb2
+
+    return xplane_pb2
+  except Exception:  # noqa: BLE001
+    return None
 
 
 # a collection of functions to tune ################################################################
@@ -90,7 +101,10 @@ class ProfileReadingTest(absltest.TestCase):
       tune_jax.CONFIG.allow_fallback_timing = True
 
   def test_parse_paths_agree(self):
-    from tune_jax.profile_reader import parse_profile, xplane_pb2
+    from tune_jax.profile_reader import parse_profile
+
+    if (xplane_pb2 := xplane_pb2_or_none()) is None:
+      self.skipTest("The vendored xplane_pb2 gencode is not loadable with the installed protobuf runtime.")
 
     xs = xplane_pb2.XSpace()
     plane = xs.planes.add(name="/device:GPU:0")
@@ -120,7 +134,10 @@ class ProfileReadingTest(absltest.TestCase):
     self.assertEqual(stats["zero_stat"], 0)
 
   def test_repeated_module_gets_distinct_key(self):
-    from tune_jax.profile_reader import parse_profile, xplane_pb2
+    from tune_jax.profile_reader import parse_profile
+
+    if (xplane_pb2 := xplane_pb2_or_none()) is None:
+      self.skipTest("The vendored xplane_pb2 gencode is not loadable with the installed protobuf runtime.")
 
     xs = xplane_pb2.XSpace()
     plane = xs.planes.add(name="/device:GPU:0")
@@ -182,6 +199,26 @@ class ProfileReadingTest(absltest.TestCase):
       self.assertEqual(sorted(fn_times), sorted(expected))
       for i, t_mean in expected.items():  # a single trace vs the mean over all profiling samples
         self.assertAlmostEqual(fn_times[i] / t_mean, 1.0, delta=0.01)
+
+  def test_aliased_candidates_are_timed_once(self):
+    # `c=1` and `c=2` take the same branch, so both settings compile to the same program. A profiler
+    # names device events after the program and not after the Python function that produced it, so
+    # on some backends these two are indistinguishable in a trace and must only be timed once.
+    x = random.normal(random.key(0), (512, 512), dtype=jnp.bfloat16)
+    y = random.normal(random.key(1), (512, 512), dtype=jnp.bfloat16)
+    fn = lambda x, y, c: _cond_fn(c, lambda x, y: x @ y, lambda x, y: x + y, x, y)
+    try:
+      tune_jax.CONFIG.allow_fallback_timing = False  # the profiler has to handle this on its own
+      fn_tuned = tune_jax.tune(fn, hyperparams={"c": [0, 1, 2]})
+      jax.block_until_ready(fn_tuned(x, y))
+    finally:
+      tune_jax.CONFIG.allow_fallback_timing = True
+
+    timings = {result.hyperparams["c"]: result for result in fn_tuned.timing_results.values()}
+    self.assertEqual(sorted(timings), [0, 1, 2])
+    for c, result in timings.items():
+      self.assertTrue(math.isfinite(result.t_mean), f"c={c} was never timed: {result}")
+    self.assertEqual((timings[1].t_mean, timings[1].t_std), (timings[2].t_mean, timings[2].t_std))
 
   def test_sum_events(self):
     from tune_jax.profile_reader.parse_profile import _sum_events

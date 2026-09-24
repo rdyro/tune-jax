@@ -2,6 +2,7 @@ import os
 import shutil
 import sys
 import traceback
+import hashlib
 import itertools
 import contextlib
 import dataclasses
@@ -11,7 +12,7 @@ import tempfile
 import time
 import re
 from functools import partial, wraps, lru_cache
-from typing import Callable, Any
+from typing import Callable, Any, Iterable
 from concurrent.futures import ThreadPoolExecutor, Future, as_completed
 import logging
 from pprint import pformat
@@ -77,6 +78,7 @@ class CompileResult:
   status: bool
   error_msg: str | None = None
   optimal_formats: Any = None
+  identity: tuple[Any, ...] = ()
 
 
 @dataclasses.dataclass
@@ -129,6 +131,54 @@ def suppress_stdout_stderr():
         os.dup2(saved_fd, fd), os.close(saved_fd)
 
 
+def _program_identity(lowered, compiled, fn_name: str) -> tuple[Any, ...]:
+  """Keys identifying the program a tuning candidate runs.
+
+  A profiler names device events after the program, not after the Python function we wrapped, so two
+  candidates that share any of these keys are indistinguishable in a trace and only one of them
+  needs to be timed.
+  """
+  # the StableHLO the candidate lowers to, with the candidate's own name normalized away. Catches
+  # hyperparameters that do not change the program at all. Backend independent.
+  text = lowered.as_text().replace(fn_name, "<tune_jax_fn>")
+  keys: list[Any] = [("hlo", hashlib.blake2b(text.encode(), digest_size=16).digest())]
+  # the runtime's own notion of program identity, which is what a profiler labels events with.
+  # Catches candidates that lower to different StableHLO but compile to the same executable.
+  try:
+    fingerprint = compiled.runtime_executable().fingerprint
+  except Exception:  # noqa: BLE001
+    fingerprint = None
+  if fingerprint:  # an empty fingerprint means the backend does not provide one, it is not an identity
+    keys.append(("fingerprint", bytes(fingerprint)))
+  return tuple(keys)
+
+
+def _alias_candidates(identities: dict[int, tuple[Any, ...]], candidates: Iterable[int]) -> dict[int, list[int]]:
+  """Group candidates that run the same program, keyed by the lowest numbered member of each group."""
+  order = list(candidates)
+  parent = {i: i for i in order}
+
+  def find(i):
+    while parent[i] != i:
+      parent[i] = parent[parent[i]]
+      i = parent[i]
+    return i
+
+  key_owner: dict[Any, int] = {}
+  for i in order:  # a shared key in *either* position makes two candidates aliases of each other
+    for key in identities.get(i, ()):
+      if key in key_owner:
+        ri, rj = find(key_owner[key]), find(i)
+        parent[max(ri, rj)] = min(ri, rj)
+      else:
+        key_owner[key] = i
+
+  groups = defaultdict(list)
+  for i in order:
+    groups[find(i)].append(i)
+  return groups
+
+
 def _try_call(
   fn: Callable[[], None],
   args_val,
@@ -137,20 +187,27 @@ def _try_call(
   compute_layouts: bool = False,
   optimal_formats: Any | None = None,
   mesh: Any | None = None,
+  fn_name: str | None = None,
 ) -> CompileResult:
   """Attempt to call the function and return whether it compiles and runs."""
   with (jax.sharding.set_mesh(mesh) if mesh is not None else contextlib.nullcontext()):
     try:
+      identity = ()
       if compile_only:
         if compute_layouts:
           to_shape = (
             lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding) if isinstance(x, jax.Array) else x
           )
           (args_shapes, kws_shapes) = jax.tree.map(to_shape, (args_val, kws_val))
-          optimal_formats = jax.jit(fn).lower(*args_shapes, **kws_shapes).compile().input_formats
+          lowered = jax.jit(fn).lower(*args_shapes, **kws_shapes)
+          compiled = lowered.compile()
+          optimal_formats = compiled.input_formats
           print(f"Optimal formats: {pformat(optimal_formats)}")
         else:
-          _ = jax.jit(fn).lower(*args_val, **kws_val).compile()
+          lowered = jax.jit(fn).lower(*args_val, **kws_val)
+          compiled = lowered.compile()
+        if fn_name is not None:
+          identity = _program_identity(lowered, compiled, fn_name)
       else:
         if optimal_formats is not None:
           place_if_array = lambda x, f: jax.device_put(x, f) if isinstance(x, jax.Array) else x
@@ -158,7 +215,7 @@ def _try_call(
           _ = jax.block_until_ready(fn(*optimal_args, **optimal_kws))
         else:
           _ = jax.block_until_ready(fn(*args_val, **kws_val))
-      return CompileResult(True, None, optimal_formats)
+      return CompileResult(True, None, optimal_formats, identity)
     except Exception as _:
       msg = traceback.format_exc()
       return CompileResult(False, msg, optimal_formats)
@@ -249,7 +306,13 @@ def _time_with_profiler(
       )
       fn_events = [(int(m[1]), duration) for k, duration in profile_events.items() if (m := re.match(fn_format, k))]
       if len({i for i, _ in fn_events}) != len(fn_events):
-        raise RuntimeError("A tuned function was executed more than once in a single profile, timings are ambiguous.")
+        plane_name = list(profile_proto.planes)[plane_id].name
+        raise RuntimeError(
+          f"A tuned function appears more than once in plane {plane_name!r} of a single profile, so its timing is"
+          f" ambiguous. Candidates that run the same program are supposed to be timed only once, so this is a"
+          f" tune-jax bug rather than a problem with the function being tuned; please report it with the"
+          f" following event names: {sorted(profile_events.keys())}"
+        )
       for i, duration in fn_events:
         if (not CONFIG._reject_zero_time_events) or duration > 0:
           plane_timings[i].append(duration)
@@ -433,7 +496,7 @@ def tune(
 
     with _global_tuning_lock:
       # filter hyperparameters for those that compile ##########################
-      optimal_formats = {}
+      optimal_formats, identities = {}, {}
       for it in range(2):  # sometimes a kernel compiles once, but not twice
         compile_only, find_optimal_layouts = (it == 0), CONFIG.find_optimal_layouts_automatically
         compiles: dict[Future[CompileResult], int] = dict()
@@ -442,7 +505,10 @@ def tune(
           fns[i] = _make_fn_to_time(fn, hs, out_shardings=out_shardings, name_id=i)
           # first time, try compiling only (to check if lowering and compilation are error free)
           opts = dict(
-            optimal_formats=optimal_formats.get(i, None), compute_layouts=find_optimal_layouts, mesh=local_mesh
+            optimal_formats=optimal_formats.get(i, None),
+            compute_layouts=find_optimal_layouts,
+            mesh=local_mesh,
+            fn_name=TUNE_FN_PREFIX_FMT.format(i),
           )
           compiles[executor.submit(_try_call, fns[i], args_val, kws_val, compile_only=compile_only, **opts)] = i
 
@@ -457,6 +523,8 @@ def tune(
         future_pbar.close()
 
         # analyze compiled results
+        if compile_only:
+          identities.update({k: x.identity for k, x in successful_compiles.items() if x.identity})
         if compile_only and find_optimal_layouts:
           for k, x in successful_compiles.items():
             optimal_formats[k] = x.optimal_formats
@@ -472,9 +540,31 @@ def tune(
         hyperparam_settings = {i: hyperparam_settings[i] for i in successful_compiles.keys()}
         fns = {i: fns[i] for i in successful_compiles.keys()}
 
+    # candidates running the same program cannot be told apart in a profile, since events are named
+    # after the program. They also have to be exactly as fast as each other, so time only one of
+    # each group and copy its result over to its aliases.
+    aliases = _alias_candidates(identities, hyperparam_settings.keys())
+    all_hyperparam_settings = hyperparam_settings
+    if len(aliases) < len(hyperparam_settings):
+      for rep, members in aliases.items():
+        if len(members) > 1:
+          logger.debug(
+            "Hyperparameters %s all compile to the same program, timing only %s",
+            [all_hyperparam_settings[i] for i in members],
+            all_hyperparam_settings[rep],
+          )
+      logger.debug("Down to %d distinct programs", len(aliases))
+      hyperparam_settings = {rep: all_hyperparam_settings[rep] for rep in aliases}
+
     # sequentially time the remaining hyperparameters ##########################
 
     results = dict()
+
+    def _record(rep: int, t_mean: float, t_std: float):
+      for i in aliases[rep]:
+        hs_i = dict(zip(hyperparams_norm.keys(), all_hyperparam_settings[i], strict=True))
+        results[i] = TimingResult(hs_i, t_mean, t_std)
+
     try:
       args_with_device = [list(args.devices())[0] for args in jax.tree.leaves(args_val) if hasattr(args, "devices")]
       if len(args_with_device) > 0:
@@ -502,9 +592,8 @@ def tune(
           if i not in profiler_timings:
             logger.warning(f"Could not find profiler results for hyperparameter settings: {hyperparam_settings[i]}")
             profiler_timings[i] = (float("inf"), float("inf"))  # nan doesn't work here since it sorts improperly
-      for i, hs in hyperparam_settings.items():
-        hs = dict(zip(hyperparams_norm.keys(), hs, strict=True))
-        results[i] = TimingResult(hs, *profiler_timings[i])
+      for i in hyperparam_settings:
+        _record(i, *profiler_timings[i])
     except Exception as e:
       if not CONFIG.allow_fallback_timing:
         print(traceback.format_exc())
@@ -514,9 +603,8 @@ def tune(
       logger.warning("Could not time with the profiler, falling back to Python-level timing")
       _opts = dict(total=len(hyperparam_settings), disable=logger.level > logging.INFO, desc="Timing...")
       hs_pbar = tqdm(hyperparam_settings.items(), **_opts)
-      for i, hs in hs_pbar:
-        hs = dict(zip(hyperparams_norm.keys(), hs, strict=True))
-        results[i] = TimingResult(hs, *_time_fn(partial(lambda fn: fn(*args_val, **kws_val), fns[i]), repeat=10))
+      for i, _ in hs_pbar:
+        _record(i, *_time_fn(partial(lambda fn: fn(*args_val, **kws_val), fns[i]), repeat=10))
 
     results = sorted(results.items(), key=lambda x: _timing_loss(x[1]))
     idx, optimal_hyperparams = results[0][0], results[0][1].hyperparams
