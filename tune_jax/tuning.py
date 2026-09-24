@@ -241,17 +241,17 @@ def _time_with_profiler(
       else:
         shutil.rmtree(profile_path, ignore_errors=True)
     profile_proto = profile_reader.parse_profile_from_bytes(profile_bytes)
-    device_plane_id = profile_reader.find_device_plane_ids(profile_proto, platform)[0]
-    profile_events = profile_reader.get_events_from_plane(
-      profile_proto, device_plane_id, prefix_filter="jit_", event_filter_regex=event_filter_regex
-    )
     fn_format = f"jit_{TUNE_FN_PREFIX_FMT.format('([0-9]+)')}.*"
-    for k, duration in profile_events.items():
-      if (m := re.match(fn_format, k)) is None:
-        continue
-      key = int(m[1])
-      if (not CONFIG._reject_zero_time_events) or duration > 0:
-        function_timings[key].append(duration)
+    plane_timings = defaultdict(list)  # planes are selected by content: only those containing the tuned functions
+    for plane_id in profile_reader.find_device_plane_ids(profile_proto, platform):
+      profile_events = profile_reader.get_events_from_plane(
+        profile_proto, plane_id, prefix_filter="jit_", event_filter_regex=event_filter_regex
+      )
+      for k, duration in profile_events.items():
+        if (m := re.match(fn_format, k)) is not None and ((not CONFIG._reject_zero_time_events) or duration > 0):
+          plane_timings[int(m[1])].append(duration)
+    for key, durations in plane_timings.items():
+      function_timings[key].append(max(durations))  # the slowest device determines the runtime
 
   for key, durations in function_timings.items():
     if len(durations) > 2:
