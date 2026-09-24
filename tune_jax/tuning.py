@@ -247,9 +247,12 @@ def _time_with_profiler(
       profile_events = profile_reader.get_events_from_plane(
         profile_proto, plane_id, prefix_filter="jit_", event_filter_regex=event_filter_regex
       )
-      for k, duration in profile_events.items():
-        if (m := re.match(fn_format, k)) is not None and ((not CONFIG._reject_zero_time_events) or duration > 0):
-          plane_timings[int(m[1])].append(duration)
+      fn_events = [(int(m[1]), duration) for k, duration in profile_events.items() if (m := re.match(fn_format, k))]
+      if len(set(i for i, _ in fn_events)) != len(fn_events):
+        raise RuntimeError("A tuned function was executed more than once in a single profile, timings are ambiguous.")
+      for i, duration in fn_events:
+        if (not CONFIG._reject_zero_time_events) or duration > 0:
+          plane_timings[i].append(duration)
     for key, durations in plane_timings.items():
       function_timings[key].append(max(durations))  # the slowest device determines the runtime
 
