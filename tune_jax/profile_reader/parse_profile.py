@@ -129,6 +129,13 @@ def get_events_from_plane(
   # on GPU we need to sum multiple scopes belonging to the same event based on the name and program id
   # NOTE: this assumes the program is called only once in the trace
   if "gpu" in planes[plane_idx].name.lower():
+    # a module execution is contiguous on the device, a module interleaved with another module was executed repeatedly
+    # repeated executions get distinct names (`name[1]`, `name[2]`, ...), so the caller can detect them
+    run_idx, prev_name = defaultdict(lambda: -1), None
+    for event in (e for e in sorted_events if e["unified_name"].startswith(prefix_filter)):
+      name = event["unified_name"]
+      run_idx[name], prev_name = run_idx[name] + (name != prev_name), name
+      event["unified_name"] = name if run_idx[name] == 0 else f"{name}[{run_idx[name]}]"
     # the events will have the same names, we want to group them and create a fake parent event
     # later logic will aggregate the children events under this fake parent
     grouped_events = defaultdict(lambda: [])

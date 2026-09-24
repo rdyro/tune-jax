@@ -117,6 +117,39 @@ class ProfileReadingTest(absltest.TestCase):
     stats = parse_profile._parse_stats(xs.planes[0].lines[0].events[0].stats, xs.planes[0].stat_metadata)
     self.assertEqual(stats["zero_stat"], 0)
 
+  def test_repeated_module_gets_distinct_key(self):
+    from tune_jax.profile_reader import parse_profile, xplane_pb2
+
+    xs = xplane_pb2.XSpace()
+    plane = xs.planes.add(name="/device:GPU:0")
+    plane.stat_metadata[1].name, plane.stat_metadata[2].name = "hlo_module", "program_id"
+    line = plane.lines.add(name="Stream #1", timestamp_ns=0)
+    for i, fn_idx in enumerate([0, 0, 1, 0]):  # f0 f1 f0 with two kernels in the first f0 execution
+      plane.event_metadata[i + 1].name = f"kernel_{i}"
+      event = line.events.add(metadata_id=i + 1, offset_ps=i * 1_000_000, duration_ps=500_000)
+      event.stats.add(metadata_id=1, str_value=f"jit_tune_jax_fn_{fn_idx}")
+      event.stats.add(metadata_id=2, int64_value=fn_idx)
+    p = parse_profile._parse_xspace_proto(xs.SerializeToString())
+    events = parse_profile.get_events_from_plane(p, 0, prefix_filter="jit_")
+    self.assertEqual(sorted(events), ["jit_tune_jax_fn_0(0)", "jit_tune_jax_fn_0(0)[1]", "jit_tune_jax_fn_1(1)"])
+    self.assertAlmostEqual(events["jit_tune_jax_fn_0(0)"], 1.5e-6)
+
+  def test_repeated_execution_raises(self):
+    if not platforms_available("gpu", "tpu"):
+      self.skipTest("Profiler device timing requires a GPU or a TPU.")
+    platform = jax.devices()[0].platform
+
+    def make(i):
+      fn = lambda x: jnp.tanh(x @ x)
+      fn.__name__ = fn.__qualname__ = tune_jax.tuning.TUNE_FN_PREFIX_FMT.format(i)
+      return jax.jit(fn)
+
+    f0, f1, x = make(0), make(1), jnp.ones((1024, 1024))
+    closure = lambda: [f(x).block_until_ready() for f in [f0, f1, f0]]
+    closure()
+    with self.assertRaisesRegex(RuntimeError, "more than once"):
+      tune_jax.tuning._time_with_profiler(closure, platform, 1)
+
   def test_profile_files_cleanup(self):
     fn = lambda x, y, dummy: x @ y
     x = jnp.ones((128, 128))
