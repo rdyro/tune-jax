@@ -26,7 +26,7 @@ class InterfaceTest(parameterized.TestCase):
     return super().setUp()
 
   def test_error(self):
-    def fn(x):
+    def fn(x, a):
       raise ValueError
 
     with self.assertRaisesRegex(ValueError, "No hyperparameters compiled successfully"):
@@ -64,6 +64,31 @@ class InterfaceTest(parameterized.TestCase):
       1
     ].hyperparams
     self.assertEqual(tuple(optimal_hyperparams.items()), tuple(fn_tuned.optimal_hyperparams.items()))
+
+  @parameterized.parameters([True, False])
+  def test_wrap_unjitted_fn_in_jit(self, wrap: bool):
+    traces = []
+
+    def fn(x, a):
+      traces.append(a)
+      for _ in range(a):  # requires a static hyperparameter
+        x = x + 1
+      return x
+
+    wrap_default, tune_jax.CONFIG.wrap_unjitted_fn_in_jit = tune_jax.CONFIG.wrap_unjitted_fn_in_jit, wrap
+    try:
+      fn_tuned = tune_jax.tune(fn, hyperparams={"a": [1, 2]})
+      fn_tuned(jnp.ones(4))  # tunes and, if jitted, populates the jit cache
+      traces.clear()
+      fn_tuned(jnp.ones(4))
+      self.assertEqual(len(traces), 0 if wrap else 1)
+    finally:
+      tune_jax.CONFIG.wrap_unjitted_fn_in_jit = wrap_default
+
+  def test_double_tune_raises(self):
+    fn_tuned = tune_jax.tune(lambda x, a: x, hyperparams={"a": [1]})
+    with self.assertRaisesRegex(ValueError, "the second time"):
+      tune_jax.tune(fn_tuned, hyperparams={"a": [1]})
 
   def test_tabulate_results(self):
     def fn(x, a, b):

@@ -50,6 +50,8 @@ class _Config:
   profiling_samples: int = 5
   # whether to attempt to compute optimal layouts for the function
   find_optimal_layouts_automatically: bool = False
+  # whether to wrap the tuned function in jax.jit (hyperparams static) if it isn't already jitted
+  wrap_unjitted_fn_in_jit: bool = True
   # whether to mark events that come back as 0.0 seconds as invalid
   _reject_zero_time_events: bool = True
 
@@ -100,9 +102,12 @@ def _get_default_device():
 
 
 def _is_concrete(x):
-  if hasattr(jax.core, "is_concrete"):
-    return jax.core.is_concrete(x)
-  return isinstance(x, jax.core.Tracer)
+  if not isinstance(x, jax.core.Tracer):
+    return x is not None
+  try:
+    return x.to_concrete_value() is not None
+  except Exception:
+    return jax.core.is_concrete(x) if hasattr(jax.core, "is_concrete") else False
 
 
 @contextlib.contextmanager
@@ -264,15 +269,6 @@ def _get_random_val(x, sharding):
   return x
 
 
-def _is_concrete(x):
-  try:
-    if isinstance(x, jax.core.Tracer):
-      return x.to_concrete_value() is not None
-    return x is not None
-  except:  # noqa: E722
-    return jax.core.is_concrete(x)
-
-
 def _try_hash_input(args, kws, must_be_concrete: bool = True):
   """For eager mode tunable, hash the shape, dtype and sharding of the inputs."""
 
@@ -359,6 +355,8 @@ def tune(
   """
 
   hyperparams_ = hyperparams if hyperparams is not None else dict()
+  wrap_in_jit = CONFIG.wrap_unjitted_fn_in_jit and not isinstance(fn_to_tune, jax.stages.Wrapped)
+  fn = jax.jit(fn_to_tune, static_argnames=tuple(hyperparams_.keys())) if wrap_in_jit else fn_to_tune
 
   def _get_best_hyperparams(args, kws):
     """Main tuning method."""
@@ -425,7 +423,7 @@ def tune(
         compiles: dict[Future[CompileResult], int] = dict()
         for i, vals in hyperparam_settings.items():
           hs = dict(zip(hyperparams_norm.keys(), vals, strict=True))
-          fns[i] = _make_fn_to_time(fn_to_tune, hs, out_shardings=out_shardings, name_id=i)
+          fns[i] = _make_fn_to_time(fn, hs, out_shardings=out_shardings, name_id=i)
           # first time, try compiling only (to check if lowering and compilation are error free)
           opts = dict(
             optimal_formats=optimal_formats.get(i, None), compute_layouts=find_optimal_layouts, mesh=local_mesh
@@ -510,7 +508,7 @@ def tune(
     logger.debug(f"optimal hyperparams: {optimal_hyperparams}")
     return fns[idx], optimal_hyperparams, results
 
-  if hasattr(fn_to_tune, "timing_result"):
+  if hasattr(fn_to_tune, "timing_results"):
     raise ValueError("Wrapping a `tune`d function in the `tune` decorator the second time is not supported.")
 
   @wraps(fn_to_tune)
@@ -527,7 +525,7 @@ def tune(
     wrapped_fn.timing_results.update(results)
     wrapped_fn.optimal_hyperparams.clear()
     wrapped_fn.optimal_hyperparams.update(optimal_hyperparameters)
-    return fn_to_tune(*args, **dict(kws, **optimal_hyperparameters))
+    return fn(*args, **dict(kws, **optimal_hyperparameters))
 
   wrapped_fn.timing_results = {}
   wrapped_fn.hyperparams_cache = {}

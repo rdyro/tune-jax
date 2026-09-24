@@ -25,6 +25,10 @@ This will benchmark `my_pallas_function` across all combinations of `block_q` an
 
 See the docstring of the `tune` function for details on all available options.
 
+If the function passed to `tune` is not already `jax.jit`-ed, it is automatically wrapped in `jax.jit` with the
+hyperparameters marked as `static_argnames`. Already jitted functions are used as-is. To disable this behavior, set
+`tune_jax.CONFIG.wrap_unjitted_fn_in_jit = False` before calling `tune`.
+
 ## Example: Tuning Attention on GPU
 
 ```python
