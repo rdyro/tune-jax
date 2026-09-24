@@ -145,7 +145,8 @@ def get_events_from_plane(
   filtered_events, starts = [], np.array([event["start_ps"] for event in sorted_events])
   for event in sorted_events:
     if event["unified_name"].startswith(prefix_filter):
-      event["children"] = _find_children(event["unified_name"], event["start_ps"], event["end_ps"], sorted_events, starts)
+      name, start_ps, end_ps = event["unified_name"], event["start_ps"], event["end_ps"]
+      event["children"] = _find_children(name, start_ps, end_ps, sorted_events, starts)
       if event_filter_regex is not None:
         # an alternative timing method, look for children based on the regex pattern
         # and sum all children events times subtracting empty space: len(|---|    |-||--|) = 6
