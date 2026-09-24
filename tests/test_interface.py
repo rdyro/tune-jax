@@ -103,6 +103,23 @@ class InterfaceTest(parameterized.TestCase):
     self.assertEqual(fd_count(), fds_before)
     self.assertEqual(os.fstat(1).st_ino, stdout_stat.st_ino)
 
+  def test_alias_candidates(self):
+    from tune_jax.tuning import _alias_candidates
+
+    hlo, fingerprint = lambda v: ("hlo", v), lambda v: ("fingerprint", v)
+    identities = {
+      0: (hlo(b"a"),),
+      1: (hlo(b"b"), fingerprint(b"F")),
+      2: (hlo(b"c"), fingerprint(b"F")),  # same executable as 1 despite lowering differently
+      3: (hlo(b"a"), fingerprint(b"G")),  # same lowering as 0
+      4: (),  # no identity available, must stay on its own
+    }
+    self.assertEqual(_alias_candidates(identities, identities.keys()), {0: [0, 3], 1: [1, 2], 4: [4]})
+
+    # aliasing is transitive across the two kinds of key
+    chained = {0: (hlo(b"a"),), 1: (hlo(b"a"), fingerprint(b"F")), 2: (hlo(b"z"), fingerprint(b"F"))}
+    self.assertEqual(_alias_candidates(chained, chained.keys()), {0: [0, 1, 2]})
+
   def test_tabulate_results(self):
     def fn(x, a, b):
       return x
