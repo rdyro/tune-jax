@@ -131,10 +131,10 @@ class SimpleCasesTest(absltest.TestCase):
 
     def fn(n, m):
       keys = random.split(random.key(0), 2)
-      # A = random.normal(keys[0], (n, m), dtype=jnp.float32)
-      # B = random.normal(keys[1], (m, n), dtype=jnp.float32)
-      A = jnp.ones((n, m), dtype=jnp.float32)
-      B = jnp.ones((m, n), dtype=jnp.float32)
+      # `jnp.ones` here would let XLA constant fold the whole computation away, making every
+      # hyperparameter setting compile to the same program and the timings meaningless
+      A = random.normal(keys[0], (n, m), dtype=jnp.float32)
+      B = random.normal(keys[1], (m, n), dtype=jnp.float32)
       C = A @ B
       return C / jnp.linalg.norm(C, axis=-1)[..., None]
 
