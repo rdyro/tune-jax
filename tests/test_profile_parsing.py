@@ -153,6 +153,37 @@ class ProfileReadingTest(absltest.TestCase):
     self.assertEqual(sorted(events), ["jit_tune_jax_fn_0(0)", "jit_tune_jax_fn_0(0)[1]", "jit_tune_jax_fn_1(1)"])
     self.assertAlmostEqual(events["jit_tune_jax_fn_0(0)"], 1.5e-6)
 
+  def test_cpu_thunk_events_span_the_module(self):
+    from tune_jax.profile_reader import parse_profile
+
+    if (xplane_pb2 := xplane_pb2_or_none()) is None:
+      self.skipTest("The vendored xplane_pb2 gencode is not loadable with the installed protobuf runtime.")
+
+    # the CPU runtime has no module-level event, every thunk is an event tagged with the module name
+    xs = xplane_pb2.XSpace()
+    plane = xs.planes.add(name="/host:CPU")
+    plane.stat_metadata[1].name, plane.stat_metadata[2].name = "hlo_module", "program_id"
+    line = plane.lines.add(name="tf_XLAPjRtCpuClient/1", timestamp_ns=0)
+    for i, (offset_ps, duration_ps) in enumerate([(0, 9_000_000), (1_000_000, 500_000), (10_000_000, 1_000_000)]):
+      plane.event_metadata[i + 1].name = f"thunk_{i}"  # e.g. a while loop thunk, a thunk in its body, a copy
+      event = line.events.add(metadata_id=i + 1, offset_ps=offset_ps, duration_ps=duration_ps)
+      event.stats.add(metadata_id=1, str_value="jit_tune_jax_fn_0")
+      event.stats.add(metadata_id=2, int64_value=3)
+    p = parse_profile._parse_xspace_proto(xs.SerializeToString())
+    events = parse_profile.get_events_from_plane(p, parse_profile.find_device_plane_ids(p, "cpu")[0], "jit_")
+    self.assertEqual(list(events), ["jit_tune_jax_fn_0(3)"])
+    self.assertAlmostEqual(events["jit_tune_jax_fn_0(3)"], 11e-6)  # first thunk start to last thunk end
+
+  def test_cpu_profiler_time_covers_execution(self):
+    # a loop executes as many short thunks on CPU; the profiler time must cover all of them, not just one
+    fn = lambda x, y: _long_while(200, x, y)
+    fn.__name__ = fn.__qualname__ = tune_jax.tuning.TUNE_FN_PREFIX_FMT.format(0)
+    fn, cpu = jax.jit(fn), jax.devices("cpu")[0]
+    x = jax.device_put(random.normal(random.key(0), (128, 128)), cpu)
+    wall_time, _ = tune_jax.tuning._time_fn(lambda: fn(x, x))
+    timings = tune_jax.tuning._time_with_profiler(lambda: fn(x, x).block_until_ready(), "cpu", 3)
+    self.assertGreater(timings[0][0], 0.5 * wall_time)
+
   def test_repeated_execution_raises(self):
     if not platforms_available("gpu", "tpu"):
       self.skipTest("Profiler device timing requires a GPU or a TPU.")

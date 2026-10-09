@@ -120,8 +120,9 @@ def get_events_from_plane(
   del all_parsed_events
 
   # on GPU we need to sum multiple scopes belonging to the same event based on the name and program id
+  # on CPU there is no module-level event either, every thunk (HLO op) is an event named after the module
   # NOTE: this assumes the program is called only once in the trace
-  if "gpu" in planes[plane_idx].name.lower():
+  if any(platform in planes[plane_idx].name.lower() for platform in ("gpu", "cpu")):
     # a module execution is contiguous on the device, a module interleaved with another module was executed repeatedly
     # repeated executions get distinct names (`name[1]`, `name[2]`, ...), so the caller can detect them
     run_idx, prev_name = defaultdict(lambda: -1), None
